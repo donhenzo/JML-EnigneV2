@@ -1,0 +1,30 @@
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Environment
+.env
+.venv
+.env.*
+
+# Local output
+/tmp/
+audit_log.jsonl
+
+# Azure Functions local config (has connection strings)
+local.settings.json
+
+# IDE personal config
+.vscode/settings.json
+
+# macOS
+.DS_Store
+
+# test scripts
+Tests/
+Scripts/
+
+.python_packages

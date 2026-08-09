@@ -1,0 +1,5 @@
+azure-data-tables
+azure-identity
+requests
+msgraph-sdk
+azure-functions

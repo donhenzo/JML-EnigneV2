@@ -1,0 +1,104 @@
+{
+  "rules": [
+    {
+      "id": "UNIVERSAL-BASELINE-EMPLOYEE-001",
+      "description": "Corporate baseline for all employees, regardless of department. No department condition — this rule matches everyone with employmentType Employee.",
+      "conditions": {
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "4d3e5b5c-57c6-4b33-a4da-3be91dabbbd0",
+        "policyId": "0ac2a5ea-fa99-4caf-bbca-0df5c5605b61"
+      }
+    },
+    {
+      "id": "FINANCE-ANALYST-001",
+      "description": "Finance Analyst baseline access",
+      "conditions": {
+        "department": { "operator": "exact", "value": "Finance" },
+        "jobTitle": { "operator": "exact", "value": "Finance Analyst" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "d92d7e03-8487-4103-ac3b-e38e625f3c1a",
+        "policyId": "44935bfd-f2e8-4d8b-b286-ea1826483e77"
+      }
+    },
+    {
+      "id": "FINANCE-ANALYST-CONTRACTOR-001",
+      "description": "Finance Analyst contractor access. No durationOverrideDays set — the contractor policy already carries a 180-day expiration (afterDuration, P180D).",
+      "conditions": {
+        "department": { "operator": "exact", "value": "Finance" },
+        "jobTitle": { "operator": "exact", "value": "Finance Analyst" },
+        "employmentType": { "operator": "exact", "value": "Contractor" }
+      },
+      "entitlements": {
+        "accessPackageId": "d92d7e03-8487-4103-ac3b-e38e625f3c1a",
+        "policyId": "f70685c6-6438-48c0-8331-11f9ecfa7e8b"
+      }
+    },
+    {
+      "id": "FINANCE-MANAGER-001",
+      "description": "Finance Manager baseline access",
+      "conditions": {
+        "department": { "operator": "exact", "value": "Finance" },
+        "jobTitle": { "operator": "contains", "value": "Manager" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "ccc4aa85-48b9-409b-bd6d-6777a29e9eb8",
+        "policyId": "0756f9f1-1992-49ee-ac58-1a08877a0910"
+      }
+    },
+    {
+      "id": "CYBERSECURITY-EMPLOYEE-001",
+      "description": "Cybersecurity department baseline (GitHub, Jira, Confluence, Cybersecurity_Users). Matches every Cybersecurity employee, including SOC staff who also match CYBERSECURITY-SOC-001 below.",
+      "conditions": {
+        "department": { "operator": "exact", "value": "Cybersecurity" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "21b3d7ce-df56-40a0-b68e-a208facfe4d0",
+        "policyId": "cd58f95e-ba47-4df5-99de-4f6a56b33bbf"
+      }
+    },
+    {
+      "id": "CYBERSECURITY-SOC-001",
+      "description": "Cybersecurity SOC sub-team, additive on top of CYBERSECURITY-EMPLOYEE-001. A SOC Joiner matches both rules and receives both packages — this is the layering pattern proven manually with Caleb (9 groups).",
+      "conditions": {
+        "department": { "operator": "exact", "value": "Cybersecurity" },
+        "jobTitle": { "operator": "contains", "value": "SOC" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "9c2f1f46-8dea-49f6-9aed-15b5c662685d",
+        "policyId": "2a2c9f9f-a8d9-40f7-99f6-9651879f51a2"
+      }
+    },
+    {
+      "id": "SWE-EMPLOYEE-001",
+      "description": "Software Engineering department baseline (GitHub, Jira, Confluence, SoftwareEngineering_Users)",
+      "conditions": {
+        "department": { "operator": "exact", "value": "Software Engineering" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "ee3711b4-7f92-4694-a24f-baa55aae7c52",
+        "policyId": "5a006188-cca4-4e0f-85ed-505a9534f85e"
+      }
+    },
+    {
+      "id": "SALES-EMPLOYEE-001",
+      "description": "Sales department baseline (PowerBI, Salesforce, Sales_Users)",
+      "conditions": {
+        "department": { "operator": "exact", "value": "Sales" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "44371b1c-49d4-49d4-b383-db52f7ab5001",
+        "policyId": "38ec9fca-d687-485a-b71d-a264caa9a31e"
+      }
+    }
+    
+  ]
+}
