@@ -1,0 +1,11 @@
+{
+  "run_timestamp": "2026-08-07T13:40:33.471823+00:00",
+  "trigger_type": "local",
+  "correlation_id": "local-run",
+  "total": 1,
+  "succeeded": 1,
+  "held": 0,
+  "failed": 0,
+  "held_records": [],
+  "failed_records": []
+}

@@ -1,0 +1,50 @@
+{
+  "upn": "daniel.okafor@eziheobed7gmail.onmicrosoft.com",
+  "employee_id": "E904",
+  "event": "Joiner",
+  "timestamp": "2026-08-07T13:38:03.428269",
+  "engine_version": "0.1.0",
+  "correlation_id": "local-run",
+  "validation_status": "Passed",
+  "normalization_status": "Passed",
+  "actions_taken": [
+    {
+      "action": "NormalizationPassed",
+      "detail": "department=Finance, job_title=Finance Analyst",
+      "timestamp": "2026-08-07T13:38:03.429782",
+      "succeeded": true
+    },
+    {
+      "action": "EntitlementsResolved",
+      "detail": "matched_rules=['UNIVERSAL-BASELINE-EMPLOYEE-001', 'FINANCE-ANALYST-001'], access_packages=['4d3e5b5c-57c6-4b33-a4da-3be91dabbbd0', 'd92d7e03-8487-4103-ac3b-e38e625f3c1a']",
+      "timestamp": "2026-08-07T13:38:05.404700",
+      "succeeded": true
+    },
+    {
+      "action": "UserCreated",
+      "detail": "upn=daniel.okafor@eziheobed7gmail.onmicrosoft.com, object_id=81a5347b-cacc-4708-b583-0dc3a3b11b1a",
+      "timestamp": "2026-08-07T13:38:11.197568",
+      "succeeded": true
+    },
+    {
+      "action": "AccessPackageAssigned",
+      "detail": "package=4d3e5b5c-57c6-4b33-a4da-3be91dabbbd0 (rule=UNIVERSAL-BASELINE-EMPLOYEE-001), duration=117s",
+      "timestamp": "2026-08-07T13:40:32.321228",
+      "succeeded": true
+    },
+    {
+      "action": "AccessPackageAssigned",
+      "detail": "package=d92d7e03-8487-4103-ac3b-e38e625f3c1a (rule=FINANCE-ANALYST-001), duration=105s",
+      "timestamp": "2026-08-07T13:40:32.321250",
+      "succeeded": true
+    }
+  ],
+  "warnings": [
+    "[ENGINE-SKIPPED] Validation engine was skipped (JML_SKIP_VALIDATION_ENGINE=true). This result is not a real governance evaluation.",
+    "[ENGINE-SKIPPED] Validation engine was skipped (JML_SKIP_VALIDATION_ENGINE=true). This result is not a real governance evaluation."
+  ],
+  "hold_reasons": [],
+  "manual_override": false,
+  "override_note": null,
+  "hold_record_id": null
+}

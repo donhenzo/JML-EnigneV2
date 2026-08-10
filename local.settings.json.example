@@ -1,0 +1,20 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "JML_STORAGE_CONNECTION_STRING": "<Azure Table Storage connection string>",
+    "AZURE_STORAGE_CONNECTION_STRING": "<same value as JML_STORAGE_CONNECTION_STRING>",
+    "JML_STORAGE_ACCOUNT_NAME": "jmlengstore",
+    "JML_MAPPING_RULES_PATH": "config/role_mapping_rules.json",
+    "JML_EVENTS_TABLE": "JmlEvents",
+    "JML_VALIDATION_ENGINE_URL": "http://localhost:7071/api/validate",
+    "JML_SKIP_VALIDATION_ENGINE": "true",
+    "AZURE_TENANT_ID": "<Entra ID tenant ID>",
+    "AZURE_CLIENT_ID": "<App registration client ID>",
+    "AZURE_CLIENT_SECRET": "<App registration client secret>",
+    "JML_LEAVER_SOFT_DELETE_HOLD_DAYS": "1",
+    "JML_PACKAGE_POLL_MAX_ATTEMPTS": "60",
+    "JML_PACKAGE_POLL_INTERVAL_SECONDS": "5"
+  }
+}

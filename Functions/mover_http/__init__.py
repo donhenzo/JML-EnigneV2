@@ -1111,18 +1111,32 @@ def run_mover_pipeline(
         recently_removed = frozenset(
             a["package_id"] for a in removal_actions if a["succeeded"]
         )
+
+        # Attribute PATCH commits the "new role" onto the user object, so it
+        # belongs to the same transaction as the removals and is gated on the
+        # same ADR-009 condition. Writing the new department/title while the
+        # additions have NOT all delivered would leave the identity's
+        # attributes claiming the new role while its packages still reflect the
+        # old one — a half-applied state that a later run's post-move
+        # verification (and the governance engine) would then read against an
+        # inconsistent object.
+        attr_succeeded, attr_error = _execute_attribute_update(
+            graph_client = graph_client,
+            user_id      = user_id,
+            patch_dict   = attr_delta.to_patch_dict(),
+        )
+        if not attr_succeeded:
+            audit_record["warnings"].append(
+                f"Attribute update failed: {attr_error}"
+            )
     else:
         audit_record["packages_removed"] = []
         recently_removed = frozenset()
-
-    attr_succeeded, attr_error = _execute_attribute_update(
-        graph_client = graph_client,
-        user_id      = user_id,
-        patch_dict   = attr_delta.to_patch_dict(),
-    )
-    if not attr_succeeded:
         audit_record["warnings"].append(
-            f"Attribute update failed: {attr_error}"
+            "Attribute update deferred — package additions did not all "
+            "deliver, so the role transition is not committed this pass "
+            "(ADR-009). Department/title remain at their previous values "
+            "until a retry lands every addition."
         )
 
 

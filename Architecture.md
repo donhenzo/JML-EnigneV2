@@ -1001,15 +1001,44 @@ Storage is one file per event. Locally that's `{employee_id}_{event}_{timestamp}
 
 ### 9.4 The Mover and Leaver Records
 
-The Joiner's report is a document. The Mover and Leaver instead write structured records to dedicated Azure Table Storage logs, because each is a change to an *existing* identity best expressed as a set of deltas and actions in a queryable row rather than a standalone file.
+The Joiner's report is a document. The Mover and Leaver instead write structured records to dedicated Azure Table Storage logs, because each is a change to an *existing* identity best expressed as a set of deltas and actions in a queryable row rather than a standalone file. Neither uses `DecisionReport` — they build plain dicts and write them directly. The `ReportEvent` enum in `Audit/models.py` still carries `Mover`, `Leaver`, and `Reconciliation` members from when `DecisionReport` was intended as the universal record; those members are vestigial and nothing references them today.
 
-The **`MoverAuditRecord`** (to `MoverAuditLog`) captures the from/to department and title, the attribute changes, the packages removed with a reason code, the packages retained with their retention reason and review date, the packages added, the unmanaged packages left untouched, the PIM changes, and the final `post_move_status` (`MOVE_SUCCESS` / `MOVE_PARTIAL` / `MOVE_FAILED` / `HOLD_FOR_REVIEW`). Some of its reason codes — the SoD-forced removal and SoD-escalation fields — are reserved but dormant, matching the dormant SoD posture elsewhere (§5.4).
+The **Mover audit record** (to `MoverAuditLog`) carries:
 
-The **`LeaverAuditRecord`** (to `LeaverAuditLog`) captures the full set of packages the user held at offboard start, every action taken in order — disable, revoke, each package removal, each PIM termination, the soft delete — all warnings, and the verification result that produced the terminal `OFFBOARD_*` status.
+| Field | Content |
+|---|---|
+| `event_type` | `"MOVE"` |
+| `employee_id`, `event_id` | Identity and event correlation |
+| `source`, `timestamp` | Origin and processing time |
+| `from_department`, `to_department` | Department transition |
+| `from_title`, `to_title` | Job title transition |
+| `attribute_changes` | Per-field `{from, to}` for every tracked attribute that changed |
+| `unmanaged_packages` | Package IDs outside the managed catalogue, each marked `NOT_PROCESSED` |
+| `packages_retained` | Each with `retention_reason` and `review_date` |
+| `packages_added` | Package IDs that reached Delivered |
+| `packages_removed` | Each with a reason code (`ROLE_CHANGE`) |
+| `sod_evaluation` | Currently `"SoDEvaluationSkipped-ADR008"` — reserved for platform SoD |
+| `sod_escalations` | Currently empty — reserved for future SoD warnings |
+| `post_move_verification` | `status`, `discrepancies`, `governance_passed`, `governance_warnings` |
+| `actions_taken` | Ordered list of per-package actions with `action`, `package_id`, `detail`, `succeeded` |
+| `warnings` | Non-blocking issues (failed attribute patch, ADR-009 deferral, etc.) |
+| `post_move_status` | Terminal: `MOVE_SUCCESS` / `MOVE_PARTIAL` / `MOVE_FAILED` |
 
-The shapes differ, but the contract does not: one record per event, written at processing time, capturing every action and the final verified outcome, immutable once written.
+The **Leaver audit record** (to `LeaverAuditLog`) carries:
 
-> Note: I've grounded the `DecisionReport` shape in the actual `Audit/models.py`. The `MoverAuditRecord` and `LeaverAuditRecord` shapes here are drawn from the pipeline drafts rather than from their model code, which I haven't seen — worth a check that the field lists match. One thing to reconcile: the shared `ReportEvent` enum in `models.py` already includes `Mover`, `Leaver`, and `Reconciliation`, which reads as if `DecisionReport` was once meant to be the universal record. If the Mover and Leaver have genuinely diverged to their own table-backed records, that's worth stating explicitly so the enum doesn't imply a uniformity that no longer holds.
+| Field | Content |
+|---|---|
+| `event_type` | `"LEAVER"` |
+| `employee_id`, `event_id` | Identity and event correlation |
+| `source`, `timestamp` | Origin and processing time |
+| `packages_at_offboard_start` | Every package the user held when the pipeline began |
+| `packages_removed` | Each removal with outcome |
+| `post_offboard_verification` | `account_disabled`, `packages_cleared`, `user_deleted`, `status` |
+| `actions_taken` | Ordered: disable, revoke, each package removal, each PIM termination, soft delete |
+| `warnings` | PIM permission gaps, deferred soft delete, partial removal failures |
+| `offboard_status` | Terminal: `OFFBOARD_SUCCESS` / `OFFBOARD_PARTIAL` / `OFFBOARD_FAILED` |
+
+The shapes differ, but the contract does not: one record per event, written at processing time, capturing every action and the final verified outcome, immutable once written. Nested dicts and lists are serialised to JSON strings before writing, since Table Storage only accepts flat scalar values.
 
 ### 9.5 The Run Summary
 
