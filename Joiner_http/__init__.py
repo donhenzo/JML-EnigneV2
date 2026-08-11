@@ -634,7 +634,10 @@ def _extract_csv_path(req, content_type: str) -> str:
         return tmp.name
 
     if "application/json" in content_type:
-        body     = req.get_json(silent=True) or {}
+        try:
+            body = req.get_json() or {}
+        except (ValueError, TypeError):
+            body = {}
         csv_path = body.get("csv_path")
         if not csv_path:
             raise ValueError("JSON body missing 'csv_path' field.")
