@@ -790,7 +790,7 @@ def _handle_early_failure(
 
 # Azure Function HTTP entry point
 
-def main(req) -> object:
+def main(req):
     """
     Azure Function HTTP trigger entry point.
 
