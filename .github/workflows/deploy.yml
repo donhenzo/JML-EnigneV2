@@ -25,7 +25,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r Requirements.txt
+          pip install -r requirements.txt
 
       - name: Syntax check
         run: python -m py_compile Joiner_http/__init__.py mover_http/__init__.py leaver_http/__init__.py
@@ -53,7 +53,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r Requirements.txt
+          pip install -r requirements.txt
 
       - name: Log in to Azure
         uses: azure/login@v2
@@ -69,3 +69,10 @@ jobs:
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
           sku: flexconsumption
           remote-build: true
+
+
+
+
+
+
+          
