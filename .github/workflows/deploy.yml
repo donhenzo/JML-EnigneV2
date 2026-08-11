@@ -28,7 +28,7 @@ jobs:
           pip install -r Requirements.txt
 
       - name: Syntax check
-        run: python -m py_compile Functions/Joiner_http/__init__.py Functions/mover_http/__init__.py Functions/leaver_http/__init__.py
+        run: python -m py_compile Joiner_http/__init__.py mover_http/__init__.py leaver_http/__init__.py
 
       - name: Run tests
         if: hashFiles('Tests/**/*.py') != ''
