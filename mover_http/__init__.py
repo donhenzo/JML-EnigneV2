@@ -1303,12 +1303,15 @@ def main(req):
     import azure.functions as func
 
     try:
-        body    = req.get_json()
-        payload = IdentityPayload(**body["payload"])
+        body = req.get_json()
+        raw = body["payload"]
+        if isinstance(raw.get("start_date"), str):
+            from datetime import date
+            raw["start_date"] = date.fromisoformat(raw["start_date"])
+        payload = IdentityPayload(**raw)
 
         conn_str     = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
         table_client = _get_table_client(conn_str)
-
         graph_service_client, credential = build_graph_client()
         graph_client = JmlGraphClient(graph_service_client, credential)
 
@@ -1317,13 +1320,11 @@ def main(req):
             table_client = table_client,
             graph_client = graph_client,
         )
-
         return func.HttpResponse(
             json.dumps(result),
             status_code = 200,
             mimetype    = "application/json",
         )
-
     except Exception as e:
         logger.error("Mover HTTP trigger failed: %s", str(e))
         return func.HttpResponse(
