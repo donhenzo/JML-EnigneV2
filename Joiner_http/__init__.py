@@ -577,12 +577,227 @@ def _write_report(
         result.errors.append(msg)
 
 
+def run_joiner_pipeline(
+    payload:      IdentityPayload,
+    table_client,
+    graph_client: JmlGraphClient,
+) -> dict:
+    """
+    Execute the Joiner pipeline for a single identity payload.
+
+    Matches the Mover/Leaver pattern: accepts an IdentityPayload directly
+    rather than a CSV path, so the HTTP trigger can accept the same
+    {"payload": {...}} JSON body all three pipelines share.
+
+    run_pipeline() (CSV mode) is unchanged and still available for
+    run_local.py and batch processing.
+    """
+    employee_id = payload.employee_id
+    connection_string = os.environ.get("JML_STORAGE_CONNECTION_STRING", "")
+    mapping_rules_path = os.environ.get(
+        "JML_MAPPING_RULES_PATH", "config/role_mapping_rules.json"
+    )
+    lookup_path = os.environ.get(
+        "LOCAL_LOOKUP_PATH", "config/canonical_lookup.json"
+    )
+    output_dir = os.environ.get("LOCAL_REPORT_DIR", "/tmp/jml_reports")
+
+    hold_queue_client = get_hold_queue_table_client(connection_string)
+    hold_queue = HoldQueueManager(AzureTableHoldQueueStore(hold_queue_client))
+    events_client = get_events_table_client(connection_string)
+
+    lookup = load_lookup_table(lookup_path)
+    normalizer = Normalizer(lookup)
+
+    try:
+        mapping_rules = load_mapping_rules(mapping_rules_path)
+    except Exception as e:
+        logger.error(f"Failed to load mapping rules: {e}")
+        return {"final_status": "FAILED", "employee_id": employee_id, "summary": f"Mapping rules load failed: {e}"}
+
+    report = DecisionReport(
+        upn=payload.upn,
+        employee_id=employee_id,
+        event=ReportEvent.JOINER,
+    )
+
+    # Normalize
+    norm_result = normalizer.normalize(payload)
+    if not norm_result.passed:
+        report.normalization_status = NormalizationStatus.FAILED
+        report.validation_status = ValidationStatus.SKIPPED
+        for reason in norm_result.failures:
+            report.add_hold_reason(reason)
+        hold_queue.create_from_normalization_failure(
+            payload=norm_result.payload, reasons=norm_result.failures,
+        )
+        _write_report_single(report, output_dir)
+        return {"final_status": "HELD", "employee_id": employee_id, "summary": f"Normalization failed: {norm_result.failures}"}
+
+    report.normalization_status = NormalizationStatus.PASSED
+    normalised_payload = norm_result.payload
+
+    # Claim event
+    event_id = generate_event_id(
+        normalised_payload.employee_id,
+        normalised_payload.action.value,
+        normalised_payload.start_date.isoformat(),
+    )
+
+    payload_json = json.dumps({
+        "employee_id": normalised_payload.employee_id,
+        "upn": normalised_payload.upn,
+        "action": normalised_payload.action.value,
+        "start_date": normalised_payload.start_date.isoformat(),
+    })
+
+    claimed = claim_event(
+        table_client=events_client,
+        employee_id=normalised_payload.employee_id,
+        action=normalised_payload.action.value,
+        start_date=normalised_payload.start_date.isoformat(),
+        payload_json=payload_json,
+        correlation_id=event_id,
+    )
+
+    if not claimed:
+        return {"final_status": "DUPLICATE", "employee_id": employee_id, "event_id": event_id, "summary": "Duplicate event — already claimed in JmlEvents."}
+
+    # Conflict check
+    conflict_outcome = check_and_handle_conflict(
+        table_client=events_client,
+        employee_id=normalised_payload.employee_id,
+        new_event_id=event_id,
+        new_action=normalised_payload.action.value,
+    )
+
+    if conflict_outcome == ConflictOutcome.QUEUED:
+        _write_report_single(report, output_dir)
+        return {"final_status": "QUEUED", "employee_id": employee_id, "event_id": event_id, "summary": "Event queued — another event in progress for this employee."}
+
+    # Resolve entitlements
+    entitlements = resolve_entitlements(
+        rules=mapping_rules,
+        department=normalised_payload.department,
+        job_title=normalised_payload.job_title,
+        employment_type=normalised_payload.employment_type.value,
+        employee_id=normalised_payload.employee_id,
+    )
+
+    report.add_action(
+        action="EntitlementsResolved",
+        detail=f"matched_rules={entitlements.matched_rule_ids}, access_packages={[ap.access_package_id for ap in entitlements.access_packages]}",
+        succeeded=True,
+    )
+
+    # Pre-provision validation
+    validation_result = pre_provision_validate(normalised_payload)
+
+    if not validation_result.passed:
+        report.validation_status = ValidationStatus.FAILED
+        for failure in validation_result.failure_summary():
+            report.add_hold_reason(failure)
+        hold_queue.create_from_validation_failure(
+            payload=normalised_payload, reasons=validation_result.failure_summary(),
+        )
+        update_event_status(
+            table_client=events_client, employee_id=normalised_payload.employee_id,
+            event_id=event_id, status=EventStatus.FAILED, failure_step="PreProvisionValidation",
+        )
+        _write_report_single(report, output_dir)
+        return {"final_status": "HELD", "employee_id": employee_id, "event_id": event_id, "summary": f"Pre-provision validation failed: {validation_result.failure_summary()}"}
+
+    report.validation_status = ValidationStatus.PASSED
+    for warning in validation_result.warning_summary():
+        report.add_warning(warning)
+
+    # Acquire lock and provision
+    instance_id = str(uuid.uuid4())
+    acquire_lock(events_client, normalised_payload.employee_id, event_id, instance_id)
+
+    provisioning_result = provision_joiner(
+        payload=normalised_payload,
+        entitlements=entitlements,
+        report=report,
+        graph_client=graph_client,
+        event_status=EventStatus.PROCESSING,
+    )
+
+    if not provisioning_result.succeeded:
+        release_lock(events_client, normalised_payload.employee_id, event_id)
+        update_event_status(
+            table_client=events_client, employee_id=normalised_payload.employee_id,
+            event_id=event_id, status=EventStatus.FAILED,
+            failure_step=provisioning_result.failure_step,
+        )
+        release_next_queued_event(
+            table_client=events_client, employee_id=normalised_payload.employee_id,
+            predecessor_status=EventStatus.FAILED,
+        )
+        _write_report_single(report, output_dir)
+        return {"final_status": "FAILED", "employee_id": employee_id, "event_id": event_id, "summary": f"Provisioning failed at {provisioning_result.failure_step}: {provisioning_result.failure_detail}"}
+
+    # Post-provision validation
+    post_result = post_provision_validate(
+        entra_object_id=provisioning_result.entra_id,
+        employee_id=normalised_payload.employee_id,
+    )
+
+    if not post_result.passed:
+        report.validation_status = ValidationStatus.FAILED
+        release_lock(events_client, normalised_payload.employee_id, event_id)
+        update_event_status(
+            table_client=events_client, employee_id=normalised_payload.employee_id,
+            event_id=event_id, status=EventStatus.FAILED, failure_step="PostProvisionValidation",
+        )
+        _write_report_single(report, output_dir)
+        return {"final_status": "FAILED", "employee_id": employee_id, "event_id": event_id, "summary": f"Post-provision validation failed: {post_result.failure_summary()}"}
+
+    for warning in post_result.warning_summary():
+        report.add_warning(warning)
+
+    # Success
+    release_lock(events_client, normalised_payload.employee_id, event_id)
+    update_event_status(
+        table_client=events_client, employee_id=normalised_payload.employee_id,
+        event_id=event_id, status=EventStatus.COMPLETED,
+    )
+    release_next_queued_event(
+        table_client=events_client, employee_id=normalised_payload.employee_id,
+        predecessor_status=EventStatus.COMPLETED,
+    )
+    _write_report_single(report, output_dir)
+
+    logger.info(f"Joiner pipeline complete — employee={employee_id}, entra_id={provisioning_result.entra_id}")
+
+    return {
+        "final_status": "COMPLETED",
+        "employee_id": employee_id,
+        "event_id": event_id,
+        "entra_id": provisioning_result.entra_id,
+        "summary": f"Joiner provisioning succeeded — {len(entitlements.access_packages)} package(s) assigned.",
+    }
+
+
+def _write_report_single(report: DecisionReport, output_dir: str) -> None:
+    """Write one audit report in single-payload mode."""
+    try:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        write_report_to_file(report, output_dir)
+    except Exception as exc:
+        logger.error(f"Audit write failed for {report.upn}: {exc}")
+
+
 def main(req):
     """
     Azure Functions HTTP trigger entry point.
 
-    The azure.functions import lives inside this function so the module
-    loads cleanly in any Python environment without the SDK installed.
+    Accepts two request formats:
+        {"payload": {...}}  — single identity, direct processing
+        {"csv_path": "..."}  — batch CSV processing (existing mode)
+
+    The payload format matches Mover and Leaver HTTP triggers, so all
+    three pipelines accept the same JSON shape from webhooks and callers.
     """
     try:
         import azure.functions as func
@@ -592,8 +807,46 @@ def main(req):
             "Use run_pipeline() directly or scripts/run_local.py for local runs."
         )
 
+    try:
+        body = req.get_json()
+    except (ValueError, TypeError):
+        body = {}
+
+    # Direct payload mode — matches Mover/Leaver pattern
+    if "payload" in body:
+        try:
+            from datetime import date
+            raw = body["payload"]
+            if isinstance(raw.get("start_date"), str):
+                raw["start_date"] = date.fromisoformat(raw["start_date"])
+            payload = IdentityPayload(**raw)
+
+            graph_service_client, credential = build_graph_client()
+            graph_client = JmlGraphClient(graph_service_client, credential)
+
+            conn_str = os.environ.get("JML_STORAGE_CONNECTION_STRING", "")
+            from azure.data.tables import TableServiceClient
+            table_client = TableServiceClient.from_connection_string(conn_str)
+
+            result = run_joiner_pipeline(
+                payload=payload,
+                table_client=table_client,
+                graph_client=graph_client,
+            )
+
+            return func.HttpResponse(
+                json.dumps(result), status_code=200, mimetype="application/json",
+            )
+
+        except Exception as e:
+            logger.error("Joiner HTTP trigger failed: %s", str(e))
+            return func.HttpResponse(
+                json.dumps({"error": str(e)}), status_code=500, mimetype="application/json",
+            )
+
+    # CSV path mode — existing behaviour
     correlation_id = req.headers.get("x-ms-client-request-id", "unknown")
-    lookup_path    = os.environ.get(
+    lookup_path = os.environ.get(
         "LOCAL_LOOKUP_PATH", "/tmp/jml_config/canonical_lookup.json"
     )
     output_dir = os.environ.get("LOCAL_REPORT_DIR", "/tmp/jml_reports")
@@ -603,22 +856,22 @@ def main(req):
         csv_path = _extract_csv_path(req, content_type)
     except ValueError as exc:
         return func.HttpResponse(
-            body=       json.dumps({"error": str(exc)}),
+            body=json.dumps({"error": str(exc)}),
             status_code=400,
-            mimetype=   "application/json",
+            mimetype="application/json",
         )
 
     pipeline_result = run_pipeline(
-        csv_path=      csv_path,
-        lookup_path=   lookup_path,
-        output_dir=    output_dir,
+        csv_path=csv_path,
+        lookup_path=lookup_path,
+        output_dir=output_dir,
         correlation_id=correlation_id,
     )
 
     return func.HttpResponse(
-        body=       json.dumps(pipeline_result.to_dict()),
+        body=json.dumps(pipeline_result.to_dict()),
         status_code=200,
-        mimetype=   "application/json",
+        mimetype="application/json",
     )
 
 
