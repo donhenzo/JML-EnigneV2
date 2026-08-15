@@ -819,6 +819,10 @@ def main(req):
             raw = body["payload"]
             if isinstance(raw.get("start_date"), str):
                 raw["start_date"] = date.fromisoformat(raw["start_date"])
+            if isinstance(raw.get("employment_type"), str):
+                raw["employment_type"] = EmploymentType(raw["employment_type"])
+            if isinstance(raw.get("action"), str):
+                raw["action"] = JmlAction(raw["action"])
             payload = IdentityPayload(**raw)
 
             graph_service_client, credential = build_graph_client()
