@@ -88,6 +88,18 @@
       }
     },
     {
+      "id": "IT-EMPLOYEE-001",
+      "description": "IT department baseline — AWS access and IT Teams/SharePoint ",
+      "conditions": {
+        "department": { "operator": "exact", "value": "Information Technology" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "fab74505-600c-4f63-a128-fe19f1805e78",
+        "policyId": "391a6f4c-f673-4480-8469-fddfb72d689a"
+      }
+    },
+    {
       "id": "SALES-EMPLOYEE-001",
       "description": "Sales department baseline (PowerBI, Salesforce, Sales_Users)",
       "conditions": {
