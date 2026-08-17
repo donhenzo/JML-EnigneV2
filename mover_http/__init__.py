@@ -86,7 +86,7 @@ from typing import Optional
 
 from azure.data.tables import TableServiceClient
 
-from Ingestion.schema import IdentityPayload, JmlAction
+from Ingestion.schema import IdentityPayload, JmlAction, EmploymentType
 from Mapping.mapping_loader import load_mapping_rules
 from Mapping.mapping_resolver import resolve_entitlements
 from Provisioning.graph_client import (
