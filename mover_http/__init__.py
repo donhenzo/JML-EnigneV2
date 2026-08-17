@@ -846,8 +846,8 @@ def run_mover_pipeline(
     )
 
     try:
-        _rules_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "config", "role_mapping_rules.json"
+        _rules_path = os.environ.get(
+            "JML_MAPPING_RULES_PATH", "config/role_mapping_rules.json"
         )
         mapping_rules = load_mapping_rules(rules_path=_rules_path)
     except Exception as e:
