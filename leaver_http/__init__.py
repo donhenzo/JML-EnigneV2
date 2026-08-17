@@ -64,7 +64,7 @@ from typing import Optional
 
 from azure.data.tables import TableServiceClient, TableClient
 
-from Ingestion.schema import IdentityPayload, JmlAction
+from Ingestion.schema import IdentityPayload, JmlAction, EmploymentType
 from Provisioning.graph_client import JmlGraphClient, GraphClientError, build_graph_client
 from Provisioning.package_requests import poll_request_until_terminal
 from Functions.Event_store.event_store import (
@@ -812,8 +812,11 @@ def main(req):
         if isinstance(raw.get("start_date"), str):
             from datetime import date
             raw["start_date"] = date.fromisoformat(raw["start_date"])
+        if isinstance(raw.get("employment_type"), str):
+            raw["employment_type"] = EmploymentType(raw["employment_type"])
+        if isinstance(raw.get("action"), str):
+            raw["action"] = JmlAction(raw["action"])
         payload = IdentityPayload(**raw)
-
         conn_str     = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
         table_client = _get_table_client(conn_str)
         graph_service_client, credential = build_graph_client()
