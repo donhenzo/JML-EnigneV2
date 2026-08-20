@@ -12,7 +12,7 @@ invents new fields.
 """
 
 from __future__ import annotations
-
+import hashlib
 from dataclasses import dataclass, field
 from datetime import date
 from enum import Enum
@@ -69,7 +69,14 @@ class IdentityPayload:
     retain_roles: bool = False                 # True = retain all existing access across transition
     retain_list: list[str] = field(default_factory=list)  # Selective list of role/group IDs to retain
 
-    #  Normalization state set by the normalization layer, not parsed from CSV ---
+    # provides which HR source this identity came from. Source-qualifies
+    # the synthetic identity ID (ADR-017) so records from different HR systems
+    # (BambooHR, later OrangeHRM) can't collide on the same employee_id.
+    # Defaults to the only source in use today; a second source's mapper sets
+    # this explicitly.
+    source: str = "BAMBOOHR"
+
+    #  Normalization state set by the normalization layer, not parsed from CSV 
     normalization_passed: bool = False
     normalization_failures: list[str] = field(default_factory=list)
    
@@ -77,6 +84,23 @@ class IdentityPayload:
     def is_normalizable(self) -> bool:
         """True only when all required normalizable fields are resolved."""
         return self.department is not None and self.job_title is not None
+
+    @property
+    def synthetic_id(self) -> str:
+        """
+        Deterministic per-identity ID: sha256(source:employee_id), 32 hex chars.
+
+        Distinct from the event store's per-event EventId (ADR-017): the synthetic
+        ID is stable across every event and lifecycle stage for one identity, where
+        EventId is deliberately per-event. This is the handle for the pre-provision
+        synthetic snapshot; the synthetic_id -> entra_object_id mapping and the
+        last-state store that also key on it are deferred to their own work items.
+
+        Lowercased before hashing to match generate_event_id's normalization, so
+        casing drift between ingestion paths can't produce two IDs for one identity.
+        """
+        raw = f"{self.source}:{self.employee_id}".lower()
+        return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
     # helps with Backwards compatibility alias for older callers.
     def is_normalized(self) -> bool:

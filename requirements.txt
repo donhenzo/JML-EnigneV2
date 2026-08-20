@@ -3,3 +3,4 @@ azure-identity
 requests
 msgraph-sdk
 azure-functions
+azure-functions-durable

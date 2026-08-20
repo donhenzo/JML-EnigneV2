@@ -18,6 +18,13 @@
 #                   Validates actual tenant state against expected state.
 #                   Validation engine makes real Graph API calls in this mode.
 #
+# SYNTHETIC IDENTITY ID (ADR-017):
+#   The pre-provision snapshot has no real Entra object to scan — the identity
+#   doesn't exist yet. payload.synthetic_id (sha256(source:employee_id)) is the
+#   stable handle for that not-yet-created identity, sent in the PreProvision
+#   body as SyntheticId. PostProvision does NOT carry it: by then the real
+#   object exists and the engine scans it directly via targetUserId.
+#
 # UPN CHECK:
 #   check_upn_exists() is handled here, not by the validation engine.
 #   The engine cannot detect UPN conflicts in PreProvision mode because it
@@ -245,12 +252,22 @@ def pre_provision_validate(payload: IdentityPayload) -> ValidationResult:
     a synthetic identity snapshot and evaluates it against the rule set without
     making any Graph API calls. This keeps PreProvision fast and side-effect free.
 
+    The synthetic identity ID (ADR-017) is sent as SyntheticId — the stable
+    handle for the not-yet-created identity that the engine keys its synthetic
+    snapshot on. It is logged before the skip check so it is visible on every
+    run, including skipped ones.
+
     The pipeline must not proceed to provisioning if this returns passed=False.
     Route the record to the hold queue using result.failure_summary() as reasons.
 
     If JML_SKIP_VALIDATION_ENGINE is set, returns an always-passing result
     without making the HTTP call at all — see the module docstring.
     """
+    logger.info(
+        f"Synthetic identity ID — employee={payload.employee_id}, "
+        f"source={payload.source}, synthetic_id={payload.synthetic_id}"
+    )
+
     if _validation_engine_skipped():
         logger.warning(
             f"Validation engine skipped ({SKIP_VALIDATION_ENGINE_ENV_VAR}=true) — "
@@ -273,6 +290,8 @@ def pre_provision_validate(payload: IdentityPayload) -> ValidationResult:
             "Location":       payload.location or "",
             "RetainRoles":    payload.retain_roles,
             "RetainList":     payload.retain_list or [],
+            "SyntheticId":    payload.synthetic_id,
+            "Source":         payload.source,
         }
     }
 
@@ -296,6 +315,7 @@ def pre_provision_validate(payload: IdentityPayload) -> ValidationResult:
 
     return result
 
+
 def post_provision_validate(entra_object_id: str, employee_id: str = "") -> ValidationResult:
     """
     Validate a provisioned Entra ID object against expected state.
@@ -303,6 +323,10 @@ def post_provision_validate(entra_object_id: str, employee_id: str = "") -> Vali
     Called after provisioning completes. The validation engine uses the
     Entra Object ID to query the real tenant and confirms required group
     memberships, RBAC assignments, and absence of legacy groups.
+
+    No synthetic ID is sent here (ADR-017): by this point the real object
+    exists, so the engine scans it directly via targetUserId. The synthetic
+    handle is only needed pre-provision, when nothing real exists to scan.
 
     A passed=False result here means provisioning completed but did not
     reach the expected state. The event should be marked Failed with class
