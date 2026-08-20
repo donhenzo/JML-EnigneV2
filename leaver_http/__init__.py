@@ -59,7 +59,7 @@ import json
 import logging
 import os
 import uuid as _uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from azure.data.tables import TableServiceClient, TableClient
@@ -93,7 +93,7 @@ LEAVER_AUDIT_LOG_TABLE = "LeaverAuditLog"
 # — it just gives operators a window for manual review before the
 # identity leaves the directory. Default is immediate deletion.
 SOFT_DELETE_HOLD_DAYS = int(os.environ.get("JML_LEAVER_SOFT_DELETE_HOLD_DAYS", "0"))
-
+STALE_LOCK_MINUTES = 10
 
 class LeaverEventStatus:
     RECEIVED          = "RECEIVED"
@@ -110,17 +110,32 @@ def _get_table_client(connection_string: str) -> TableServiceClient:
     return TableServiceClient.from_connection_string(connection_string)
 
 
+def _is_stale_in_progress(row: dict) -> bool:
+    """
+    True if an IN_PROGRESS event log row is older than STALE_LOCK_MINUTES.
+
+    A 504-killed run leaves its EventLog row IN_PROGRESS with no terminal
+    write. Without this, the reclaimed retry is blocked as QUEUED_CONCURRENT
+    even though the JmlEvents lock has already been reclaimed. Same staleness
+    window as the event store lock, so both agree on when a run is dead.
+    """
+    updated_at = row.get("updated_at", "")
+    if not updated_at:
+        return False
+    try:
+        updated = datetime.fromisoformat(updated_at)
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - updated > timedelta(minutes=STALE_LOCK_MINUTES)
+    except (ValueError, TypeError):
+        return True
+
+
 def _check_concurrent_event(
     table_client: TableServiceClient,
     employee_id:  str,
 ) -> bool:
-    """
-    Return True if an IN_PROGRESS Leaver event already exists for this
-    employee. Mirrors the Mover's MoverEventLog check (ADR-004).
-
-    Fails closed — if the query itself fails, returns True to prevent
-    a second offboarding event from running on top of an unknown state.
-    """
+    """..."""
     try:
         client   = table_client.get_table_client(LEAVER_EVENT_LOG_TABLE)
         entities = client.query_entities(
@@ -129,7 +144,17 @@ def _check_concurrent_event(
                 f"and status eq 'IN_PROGRESS'"
             )
         )
-        return any(True for _ in entities)
+        for row in entities:
+            if _is_stale_in_progress(row):
+                logger.warning(
+                    "Stale IN_PROGRESS event log row ignored — employee=%s, "
+                    "event=%s, updated_at=%s. Prior run likely killed before "
+                    "terminal write (504). Allowing reclaimed retry to proceed.",
+                    employee_id, row.get("RowKey", ""), row.get("updated_at", ""),
+                )
+                continue
+            return True
+        return False
     except Exception as e:
         logger.error(
             "LeaverEventLog concurrent check failed — employee=%s, error=%s",

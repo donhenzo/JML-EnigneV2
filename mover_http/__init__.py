@@ -146,20 +146,34 @@ def _get_table_client(connection_string: str) -> TableServiceClient:
     return TableServiceClient.from_connection_string(connection_string)
 
 
+from datetime import datetime, timezone, timedelta
+
+def _is_stale_in_progress(row: dict) -> bool:
+    """
+    True if an IN_PROGRESS event log row is older than STALE_LOCK_MINUTES.
+
+    A 504-killed run leaves its EventLog row IN_PROGRESS with no terminal
+    write. Without this, the reclaimed retry is blocked as QUEUED_CONCURRENT
+    even though the JmlEvents lock has already been reclaimed. Same staleness
+    window as the event store lock, so both agree on when a run is dead.
+    """
+    updated_at = row.get("updated_at", "")
+    if not updated_at:
+        return False
+    try:
+        updated = datetime.fromisoformat(updated_at)
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - updated > timedelta(minutes=STALE_LOCK_MINUTES)
+    except (ValueError, TypeError):
+        return True
+
+
 def _check_concurrent_event(
     table_client: TableServiceClient,
     employee_id:  str,
 ) -> bool:
-    """
-    Return True if an IN_PROGRESS event already exists for this employee.
-
-    Queries MoverEventLog by PartitionKey = employee_id and
-    status = IN_PROGRESS. Per ADR-004, only one Mover event per
-    employee can be active at a time.
-
-    Fails closed — if the query itself fails, returns True to prevent
-    a second event from running on top of an unknown state.
-    """
+    """..."""
     try:
         client   = table_client.get_table_client(MOVER_EVENT_LOG_TABLE)
         entities = client.query_entities(
@@ -168,7 +182,17 @@ def _check_concurrent_event(
                 f"and status eq 'IN_PROGRESS'"
             )
         )
-        return any(True for _ in entities)
+        for row in entities:
+            if _is_stale_in_progress(row):
+                logger.warning(
+                    "Stale IN_PROGRESS event log row ignored — employee=%s, "
+                    "event=%s, updated_at=%s. Prior run likely killed before "
+                    "terminal write (504). Allowing reclaimed retry to proceed.",
+                    employee_id, row.get("RowKey", ""), row.get("updated_at", ""),
+                )
+                continue
+            return True
+        return False
     except Exception as e:
         logger.error(
             "MoverEventLog concurrent check failed — employee=%s, error=%s",

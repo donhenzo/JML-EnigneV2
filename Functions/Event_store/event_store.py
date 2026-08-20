@@ -118,11 +118,7 @@ def claim_event(
         )
         return True
     except ResourceExistsError:
-        logger.info(
-            f"Duplicate event — employee={employee_id}, action={action}, "
-            f"event_id={event_id}. Exiting cleanly."
-        )
-        return False
+        return _handle_existing_event(table_client, employee_id, event_id, action)
 
 
 def get_event(
@@ -235,13 +231,19 @@ def is_stale_lock(event: JmlEvent) -> bool:
         return True
 
 
-def reclaim_stale_event(
+def reclaim_event(
     table_client: TableClient,
     employee_id: str,
     event_id: str,
     current_retry_count: int
 ) -> None:
-    """Reset a stale locked event to Pending for retry."""
+    """
+    Reset an event to Pending so it can be retried.
+
+    Covers two recovery cases with the same reset: a stale Processing lock
+    left by a crashed run, and a Failed event being re-run. Clears the lock,
+    bumps the retry count, and drops any stale failure step.
+    """
     table_client.update_entity(
         {
             "PartitionKey": employee_id,
@@ -249,13 +251,14 @@ def reclaim_stale_event(
             "Status":       EventStatus.PENDING,
             "LockedAt":     None,
             "LockedBy":     None,
+            "FailureStep":  "",
             "RetryCount":   current_retry_count + 1,
             "LastUpdated":  _now_utc(),
         },
         mode=UpdateMode.MERGE
     )
     logger.warning(
-        f"Stale lock reclaimed — employee={employee_id}, "
+        f"Event reclaimed for retry — employee={employee_id}, "
         f"event_id={event_id}, retry_count={current_retry_count + 1}"
     )
 
@@ -291,7 +294,7 @@ def check_active_event(
         )
 
         if status == EventStatus.PROCESSING and is_stale_lock(event):
-            reclaim_stale_event(
+            reclaim_event(
                 table_client, employee_id,
                 event.event_id, event.retry_count
             )
@@ -300,3 +303,50 @@ def check_active_event(
         return event
 
     return None
+
+
+def _handle_existing_event(
+    table_client: TableClient,
+    employee_id: str,
+    event_id: str,
+    action: str
+) -> bool:
+    """
+    Decide whether an already-claimed event can be reclaimed for retry.
+
+    Called when claim_event hits a duplicate RowKey. Reads the existing row
+    and branches on status. Fail-closed: only Failed and stale Processing
+    events are reclaimed; every other status is treated as a genuine
+    duplicate and exits cleanly.
+    """
+    existing = get_event(table_client, employee_id, event_id)
+
+    if existing is None:
+        # Row reported as existing on insert but is gone now — no claim to honour.
+        logger.warning(
+            f"Event vanished after duplicate insert — employee={employee_id}, "
+            f"event_id={event_id}. Exiting cleanly."
+        )
+        return False
+
+    if existing.status == EventStatus.FAILED:
+        reclaim_event(table_client, employee_id, event_id, existing.retry_count)
+        logger.info(
+            f"Failed event reclaimed for retry — employee={employee_id}, "
+            f"action={action}, event_id={event_id}"
+        )
+        return True
+
+    if existing.status == EventStatus.PROCESSING and is_stale_lock(existing):
+        reclaim_event(table_client, employee_id, event_id, existing.retry_count)
+        logger.warning(
+            f"Stale Processing event reclaimed for retry — employee={employee_id}, "
+            f"action={action}, event_id={event_id}"
+        )
+        return True
+
+    logger.info(
+        f"Duplicate event — employee={employee_id}, action={action}, "
+        f"event_id={event_id}, status={existing.status}. Exiting cleanly."
+    )
+    return False
