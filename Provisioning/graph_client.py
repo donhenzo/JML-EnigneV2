@@ -57,6 +57,7 @@ import logging
 import os
 import time
 from functools import wraps
+from types import coroutine
 
 from azure.identity import ClientSecretCredential
 from msgraph.graph_service_client import GraphServiceClient
@@ -320,18 +321,19 @@ class JmlGraphClient:
         """
         Run an async Graph SDK coroutine synchronously.
 
-        Tries the existing event loop first. If there is none (plain script
-        or fresh thread), creates one and cleans it up after the call.
+        Creates a dedicated event loop per call and closes it after, so a loop
+        is never reused across Azure Functions invocations (workers are reused;
+        a loop closed on a prior invocation would poison the SDK's cached
+        transport with 'Event loop is closed'). Slightly more overhead per call,
+        but correct on a long-lived worker.
         """
+        loop = asyncio.new_event_loop()
         try:
-            return asyncio.get_event_loop().run_until_complete(coroutine)
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            try:
-                return loop.run_until_complete(coroutine)
-            finally:
-                loop.close()
+            return loop.run_until_complete(coroutine)
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
 
     @retry_on_throttle(max_retries=3, base_backoff=2.0)
     def get_user(self, upn: str) -> dict:
