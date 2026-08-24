@@ -44,7 +44,7 @@ from enum import Enum
 from typing import Optional
 
 from Provisioning.graph_client import JmlGraphClient, GraphClientError
-from validation.validation_gate import post_provision_validate, ValidationResult
+from Validation.validation_gate import post_provision_validate, ValidationResult
 
 logger = logging.getLogger(__name__)
 

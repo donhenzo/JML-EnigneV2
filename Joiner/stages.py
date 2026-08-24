@@ -41,7 +41,7 @@ from Functions.Event_store.conflict_queue import (
 from Mapping.mapping_loader import load_mapping_rules
 from Mapping.mapping_resolver import resolve_entitlements
 
-from validation.validation_gate import pre_provision_validate, post_provision_validate
+from Validation.validation_gate import pre_provision_validate, post_provision_validate
 from datetime import date
 from Audit.models import DecisionReport, ReportEvent
 from Mapping.mapping_resolver import (
