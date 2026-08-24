@@ -207,8 +207,8 @@ def release_lock(
         {
             "PartitionKey": employee_id,
             "RowKey":       event_id,
-            "LockedAt":     None,
-            "LockedBy":     None,
+            "LockedAt":     "",
+            "LockedBy":     "",
             "LastUpdated":  _now_utc(),
         },
         mode=UpdateMode.MERGE
@@ -230,7 +230,6 @@ def is_stale_lock(event: JmlEvent) -> bool:
     except (ValueError, TypeError):
         return True
 
-
 def reclaim_event(
     table_client: TableClient,
     employee_id: str,
@@ -249,8 +248,8 @@ def reclaim_event(
             "PartitionKey": employee_id,
             "RowKey":       event_id,
             "Status":       EventStatus.PENDING,
-            "LockedAt":     None,
-            "LockedBy":     None,
+            "LockedAt":     "",
+            "LockedBy":     "",
             "FailureStep":  "",
             "RetryCount":   current_retry_count + 1,
             "LastUpdated":  _now_utc(),

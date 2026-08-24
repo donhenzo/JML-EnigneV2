@@ -105,3 +105,50 @@ class IdentityPayload:
     # helps with Backwards compatibility alias for older callers.
     def is_normalized(self) -> bool:
         return self.is_normalizable()
+
+    def to_dict(self) -> dict:
+        """
+        Plain-dict form for crossing a stage/activity boundary as JSON.
+        Enums flatten to their .value, date to ISO string. source and the
+        derived synthetic_id are included so a stage that needs provenance
+        doesn't have to recompute it.
+        """
+        return {
+            "employee_id":     self.employee_id,
+            "upn":             self.upn,
+            "display_name":    self.display_name,
+            "department":      self.department,
+            "job_title":       self.job_title,
+            "manager_id":      self.manager_id,
+            "start_date":      self.start_date.isoformat(),
+            "employment_type": self.employment_type.value,
+            "location":        self.location,
+            "action":          self.action.value,
+            "source":          self.source,
+            "retain_roles":    self.retain_roles,
+            "retain_list":     self.retain_list,
+            "synthetic_id":    self.synthetic_id,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "IdentityPayload":
+        """
+        Reconstruct from the dict form. Inverse of to_dict. synthetic_id is
+        a computed property, not a field, so it's ignored on the way back in
+        — it's re-derived from source + employee_id.
+        """
+        return cls(
+            employee_id=     raw["employee_id"],
+            upn=             raw["upn"],
+            display_name=    raw["display_name"],
+            department=      raw.get("department"),
+            job_title=       raw.get("job_title"),
+            manager_id=      raw.get("manager_id"),
+            start_date=      date.fromisoformat(raw["start_date"]),
+            employment_type= EmploymentType(raw["employment_type"]),
+            location=        raw.get("location"),
+            action=          JmlAction(raw["action"]),
+            source=          raw.get("source", "BAMBOOHR"),
+            retain_roles=    raw.get("retain_roles", False),
+            retain_list=     raw.get("retain_list", []),
+        )

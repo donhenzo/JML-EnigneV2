@@ -95,11 +95,17 @@ from Functions.Event_store.conflict_queue import (
     ConflictOutcome,
     release_next_queued_event,
 )
-from Validation.validation_gate import pre_provision_validate, post_provision_validate
+from validation.validation_gate import pre_provision_validate, post_provision_validate
 from Provisioning.provisioner import provision_joiner
 from Provisioning.graph_client import build_graph_client, JmlGraphClient
 from Audit.run_summary_writer import write_run_summary
 
+from Joiner.stages import (
+    stage_normalize, stage_claim_event, stage_conflict_check,
+    stage_resolve_entitlements, stage_pre_validate, stage_provision,
+    stage_post_validate, stage_finalize,
+)
+from Joiner.stage_result import StageOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +127,143 @@ class PipelineResult:
             "failed":    self.failed,
             "errors":    self.errors,
         }
+
+def _execute_joiner_stages(
+    normalised_payload: IdentityPayload,
+    report:             DecisionReport,
+    events_client,
+    graph_client:       JmlGraphClient | None,
+    hold_queue,
+) -> dict:
+    """
+    Run the post-normalization Joiner stages for one normalized identity:
+    claim -> conflict -> resolve -> pre-validate -> provision -> post-validate
+    -> finalize.
+
+    Shared by both drivers. Assumes the payload is already normalized (the
+    caller owns normalization and its failure reporting, which differs between
+    single-payload and batch). Populates the passed report via each stage's
+    report entries and the validation status enums. Owns the hold-queue writes
+    for validation failures.
+
+    Returns {final_status, event_id?, entra_id?, summary}. Does NOT write the
+    report file and does NOT touch batch counters — the caller owns those.
+    """
+    employee_id = normalised_payload.employee_id
+
+    def apply(result):
+        for action in result.report_actions:
+            report.add_action(**action)
+        for warning in result.report_warnings:
+            report.add_warning(warning)
+
+    # Claim
+    claim = stage_claim_event(normalised_payload, correlation_id="", events_client=events_client)
+    apply(claim)
+    event_id = claim.data["event_id"]
+
+    if claim.outcome == StageOutcome.DUPLICATE:
+        return {"final_status": "DUPLICATE", "employee_id": employee_id, "event_id": event_id, "summary": "Duplicate event — already claimed in JmlEvents."}
+    if claim.outcome == StageOutcome.SKIPPED:
+        return {"final_status": "SKIPPED", "employee_id": employee_id, "event_id": event_id, "summary": "Active event already processing this employee."}
+
+    # Conflict
+    conflict = stage_conflict_check(normalised_payload, event_id=event_id, events_client=events_client)
+    apply(conflict)
+    if conflict.outcome == StageOutcome.QUEUED:
+        return {"final_status": "QUEUED", "employee_id": employee_id, "event_id": event_id, "summary": "Event queued — another event in progress for this employee."}
+
+    # Resolve
+    resolve = stage_resolve_entitlements(normalised_payload, event_id=event_id)
+    apply(resolve)
+
+    # Pre-provision validation
+    pre = stage_pre_validate(normalised_payload, event_id=event_id)
+    apply(pre)
+    if pre.outcome == StageOutcome.HELD:
+        report.validation_status = ValidationStatus.FAILED
+        for reason in pre.hold_reasons:
+            report.add_hold_reason(reason)
+        hold_record = hold_queue.create_from_validation_failure(
+            payload=normalised_payload, reasons=pre.hold_reasons,
+        )
+        report.hold_record_id = hold_record.record_id
+        update_event_status(
+            table_client=events_client, employee_id=employee_id,
+            event_id=event_id, status=EventStatus.FAILED, failure_step="PreProvisionValidation",
+        )
+        return {"final_status": "HELD", "employee_id": employee_id, "event_id": event_id, "summary": f"Pre-provision validation failed: {pre.hold_reasons}"}
+
+    report.validation_status = ValidationStatus.PASSED
+
+    # Graph client guard
+    if graph_client is None:
+        report.add_action(
+            action="ProvisioningSkipped",
+            detail="Graph client not available — check credentials in local.settings.json",
+            succeeded=False,
+        )
+        update_event_status(
+            table_client=events_client, employee_id=employee_id,
+            event_id=event_id, status=EventStatus.FAILED, failure_step="GraphClientUnavailable",
+        )
+        return {"final_status": "FAILED", "employee_id": employee_id, "event_id": event_id, "summary": "Graph client not available"}
+
+    # Acquire lock and provision
+    instance_id = str(uuid.uuid4())
+    acquire_lock(events_client, employee_id, event_id, instance_id)
+
+    provision = stage_provision(
+        normalised_payload, event_id=event_id,
+        access_packages=resolve.data["access_packages"],
+        pim_groups=resolve.data["pim_groups"],
+        graph_client=graph_client,
+    )
+    apply(provision)
+
+    if provision.outcome == StageOutcome.FAILED:
+        finalize = stage_finalize(
+            normalised_payload, event_id=event_id,
+            final_status=EventStatus.FAILED, failure_step=provision.data["failure_step"],
+            events_client=events_client,
+        )
+        apply(finalize)
+        return {"final_status": "FAILED", "employee_id": employee_id, "event_id": event_id, "summary": f"Provisioning failed at {provision.data['failure_step']}: {provision.data.get('failure_detail')}"}
+
+    entra_id = provision.data["entra_id"]
+
+    # Post-provision validation
+    post = stage_post_validate(entra_id=entra_id, event_id=event_id, employee_id=employee_id)
+    apply(post)
+
+    if post.outcome == StageOutcome.FAILED:
+        report.validation_status = ValidationStatus.FAILED
+        finalize = stage_finalize(
+            normalised_payload, event_id=event_id,
+            final_status=EventStatus.FAILED, failure_step="PostProvisionValidation",
+            events_client=events_client,
+        )
+        apply(finalize)
+        return {"final_status": "FAILED", "employee_id": employee_id, "event_id": event_id, "summary": f"Post-provision validation failed: {post.summary}"}
+
+    # Success
+    finalize = stage_finalize(
+        normalised_payload, event_id=event_id,
+        final_status=EventStatus.COMPLETED, events_client=events_client,
+    )
+    apply(finalize)
+
+    logger.info(f"Joiner pipeline complete — employee={employee_id}, entra_id={entra_id}")
+    return {
+        "final_status": "COMPLETED",
+        "employee_id": employee_id,
+        "event_id": event_id,
+        "entra_id": entra_id,
+        "summary": f"Joiner provisioning succeeded — {len(resolve.data['access_packages'])} package(s) assigned.",
+    }
+
+
+
 
 
 def run_pipeline(
@@ -239,7 +382,7 @@ def run_pipeline(
             result.held  += 1
             continue
 
-        # Step 2 — Normalise
+                # Step 2 — Normalise
         report = DecisionReport(
             upn=           payload.upn,
             employee_id=   payload.employee_id,
@@ -252,16 +395,12 @@ def run_pipeline(
         if not norm_result.passed:
             report.normalization_status = NormalizationStatus.FAILED
             report.validation_status    = ValidationStatus.SKIPPED
-
             for reason in norm_result.failures:
                 report.add_hold_reason(reason)
-
             hold_record = hold_queue.create_from_normalization_failure(
-                payload=norm_result.payload,
-                reasons=norm_result.failures,
+                payload=norm_result.payload, reasons=norm_result.failures,
             )
             report.hold_record_id = hold_record.record_id
-
             all_reports.append(report)
             _write_report(report, output_dir, result)
             result.total += 1
@@ -271,297 +410,31 @@ def run_pipeline(
         report.normalization_status = NormalizationStatus.PASSED
         report.add_action(
             action="NormalizationPassed",
-            detail=(
-                f"department={norm_result.payload.department}, "
-                f"job_title={norm_result.payload.job_title}"
-            ),
-        )
-        normalised_payload = norm_result.payload
-
-        # Step 3 — Check for stale locks (GAP-002 remediation)
-        active = check_active_event(
-            table_client=events_client,
-            employee_id= normalised_payload.employee_id,
+            detail=f"department={norm_result.payload.department}, job_title={norm_result.payload.job_title}",
         )
 
-        if active and active.status == EventStatus.PROCESSING:
-            logger.info(
-                f"Active event in progress — employee={normalised_payload.employee_id}, "
-                f"locked_by={active.locked_by}, exiting"
-            )
-            report.add_action(
-                action="ActiveEventSkipped",
-                detail=f"Another instance processing this employee (locked by {active.locked_by})",
-                succeeded=True,
-            )
-            all_reports.append(report)
-            _write_report(report, output_dir, result)
-            result.total     += 1
-            result.succeeded += 1
-            continue
-
-        # Step 4 — Claim event
-        import json as _json
-        payload_json = _json.dumps({
-            "employee_id": normalised_payload.employee_id,
-            "upn":         normalised_payload.upn,
-            "action":      normalised_payload.action.value,
-            "start_date":  normalised_payload.start_date.isoformat(),
-        })
-
-        claimed = claim_event(
-            table_client=   events_client,
-            employee_id=    normalised_payload.employee_id,
-            action=         normalised_payload.action.value,
-            start_date=     normalised_payload.start_date.isoformat(),
-            payload_json=   payload_json,
-            correlation_id= correlation_id,
+        # Stages 3-10 via the shared sequence
+        stage_result = _execute_joiner_stages(
+            normalised_payload=norm_result.payload,
+            report=report,
+            events_client=events_client,
+            graph_client=graph_client,
+            hold_queue=hold_queue,
         )
-
-        if not claimed:
-            logger.info(
-                f"Duplicate event — skipping — "
-                f"employee={normalised_payload.employee_id}"
-            )
-            report.add_action(
-                action="DuplicateEventSkipped",
-                detail="Event already exists in event store, idempotency exit",
-                succeeded=True,
-            )
-            all_reports.append(report)
-            _write_report(report, output_dir, result)
-            result.total     += 1
-            result.succeeded += 1
-            continue
-
-        event_id = generate_event_id(
-            normalised_payload.employee_id,
-            normalised_payload.action.value,
-            normalised_payload.start_date.isoformat(),
-        )
-
-        # Step 5 — Conflict check
-        conflict_outcome = check_and_handle_conflict(
-            table_client= events_client,
-            employee_id=  normalised_payload.employee_id,
-            new_event_id= event_id,
-            new_action=   normalised_payload.action.value,
-        )
-
-        if conflict_outcome == ConflictOutcome.QUEUED:
-            report.add_action(
-                action="EventQueued",
-                detail="Active event in progress — queued behind existing event",
-                succeeded=True,
-            )
-            report.add_warning(
-                "Event queued — will process after active event completes"
-            )
-            all_reports.append(report)
-            _write_report(report, output_dir, result)
-            result.total     += 1
-            result.succeeded += 1
-            continue
-
-        # Step 6 — Resolve entitlements
-        entitlements = resolve_entitlements(
-            rules=           mapping_rules,
-            department=      normalised_payload.department,
-            job_title=       normalised_payload.job_title,
-            employment_type= normalised_payload.employment_type.value,
-            employee_id=     normalised_payload.employee_id,
-        )
-
-        report.add_action(
-            action="EntitlementsResolved",
-            detail=(
-                f"matched_rules={entitlements.matched_rule_ids}, "
-                f"access_packages="
-                f"{[ap.access_package_id for ap in entitlements.access_packages]}"
-            ),
-            succeeded=True,
-        )
-
-        if not entitlements.matched_rule_ids:
-            report.add_warning(
-                "No mapping rules matched — user will have no access package assignments"
-            )
-
-        # Step 7 — Pre-provision validation gate (PowerShell governance engine)
-        validation_result = pre_provision_validate(normalised_payload)
-
-        if not validation_result.passed:
-            report.validation_status = ValidationStatus.FAILED
-
-            for failure in validation_result.failure_summary():
-                report.add_hold_reason(failure)
-
-            hold_record = hold_queue.create_from_validation_failure(
-                payload=normalised_payload,
-                reasons=validation_result.failure_summary(),
-            )
-            report.hold_record_id = hold_record.record_id
-
-            update_event_status(
-                table_client= events_client,
-                employee_id=  normalised_payload.employee_id,
-                event_id=     event_id,
-                status=       EventStatus.FAILED,
-                failure_step= "PreProvisionValidation",
-            )
-
-            all_reports.append(report)
-            _write_report(report, output_dir, result)
-            result.total += 1
-            result.held  += 1
-            continue
-
-        report.validation_status = ValidationStatus.PASSED
-        for warning in validation_result.warning_summary():
-            report.add_warning(warning)
-
-        # Step 8 — Guard: Graph client must be available before acquiring lock.
-        if graph_client is None:
-            report.add_action(
-                action="ProvisioningSkipped",
-                detail="Graph client not available — check credentials in local.settings.json",
-                succeeded=False,
-            )
-            update_event_status(
-                table_client= events_client,
-                employee_id=  normalised_payload.employee_id,
-                event_id=     event_id,
-                status=       EventStatus.FAILED,
-                failure_step= "GraphClientUnavailable",
-            )
-            all_reports.append(report)
-            _write_report(report, output_dir, result)
-            result.total  += 1
-            result.failed += 1
-            continue
-
-        instance_id = str(uuid.uuid4())
-        acquire_lock(events_client, normalised_payload.employee_id, event_id, instance_id)
-
-        provisioning_result = provision_joiner(
-            payload=      normalised_payload,
-            entitlements= entitlements,
-            report=       report,
-            graph_client= graph_client,
-            event_status= EventStatus.PROCESSING,
-        )
-
-        if not provisioning_result.succeeded:
-            release_lock(events_client, normalised_payload.employee_id, event_id)
-            update_event_status(
-                table_client= events_client,
-                employee_id=  normalised_payload.employee_id,
-                event_id=     event_id,
-                status=       EventStatus.FAILED,
-                failure_step= provisioning_result.failure_step,
-            )
-
-            next_event = release_next_queued_event(
-                table_client=       events_client,
-                employee_id=        normalised_payload.employee_id,
-                predecessor_status= EventStatus.FAILED,
-            )
-            if next_event:
-                logger.warning(
-                    f"Next queued event held for review — employee={normalised_payload.employee_id}, "
-                    f"event_id={next_event.event_id} — predecessor failed at {provisioning_result.failure_step}"
-                )
-
-            all_reports.append(report)
-            _write_report(report, output_dir, result)
-            result.total  += 1
-            result.failed += 1
-            continue
-
-        # Step 9 — Post-provision validation
-        post_result = post_provision_validate(
-            entra_object_id=provisioning_result.entra_id,
-            employee_id=    normalised_payload.employee_id,
-        )
-
-        if not post_result.passed:
-            report.validation_status = ValidationStatus.FAILED
-            report.add_action(
-                action="PostProvisionValidationFailed",
-                detail=f"failures={post_result.failure_summary()}",
-                succeeded=False,
-            )
-            release_lock(events_client, normalised_payload.employee_id, event_id)
-            update_event_status(
-                table_client= events_client,
-                employee_id=  normalised_payload.employee_id,
-                event_id=     event_id,
-                status=       EventStatus.FAILED,
-                failure_step= "PostProvisionValidation",
-            )
-
-            next_event = release_next_queued_event(
-                table_client=       events_client,
-                employee_id=        normalised_payload.employee_id,
-                predecessor_status= EventStatus.FAILED,
-            )
-            if next_event:
-                logger.warning(
-                    f"Next queued event held for review — employee={normalised_payload.employee_id}, "
-                    f"event_id={next_event.event_id} — predecessor failed post-provision validation"
-                )
-
-            all_reports.append(report)
-            _write_report(report, output_dir, result)
-            result.total  += 1
-            result.failed += 1
-            continue
-
-        for warning in post_result.warning_summary():
-            report.add_warning(warning)
-
-        # Step 10 — Provisioning succeeded
-        release_lock(events_client, normalised_payload.employee_id, event_id)
-        update_event_status(
-            table_client=events_client,
-            employee_id= normalised_payload.employee_id,
-            event_id=    event_id,
-            status=      EventStatus.COMPLETED,
-        )
-
-        next_event = release_next_queued_event(
-            table_client=       events_client,
-            employee_id=        normalised_payload.employee_id,
-            predecessor_status= EventStatus.COMPLETED,
-        )
-        if next_event:
-            logger.info(
-                f"Next queued event auto-released — employee={normalised_payload.employee_id}, "
-                f"event_id={next_event.event_id}, action={next_event.action}"
-            )
 
         all_reports.append(report)
         _write_report(report, output_dir, result)
-        result.total     += 1
-        result.succeeded += 1
+        result.total += 1
 
-    logger.info(
-        "Pipeline complete — total=%d, succeeded=%d, held=%d, failed=%d",
-        result.total,
-        result.succeeded,
-        result.held,
-        result.failed,
-    )
-
-    write_run_summary(
-        reports=       all_reports,
-        output_dir=    output_dir,
-        trigger_type=  "local",
-        correlation_id=correlation_id,
-    )
+        _COUNTER_MAP = {
+            "COMPLETED": "succeeded", "DUPLICATE": "succeeded",
+            "QUEUED": "succeeded", "SKIPPED": "succeeded",
+            "HELD": "held", "FAILED": "failed",
+        }
+        setattr(result, _COUNTER_MAP[stage_result["final_status"]],
+                getattr(result, _COUNTER_MAP[stage_result["final_status"]]) + 1)
 
     return result
-
 
 def _write_report(
     report:     DecisionReport,
@@ -576,44 +449,25 @@ def _write_report(
         logger.exception(msg)
         result.errors.append(msg)
 
-
-def run_joiner_pipeline(
+def joiner_pipeline(
     payload:      IdentityPayload,
     table_client,
     graph_client: JmlGraphClient,
 ) -> dict:
     """
-    Execute the Joiner pipeline for a single identity payload.
-
-    Matches the Mover/Leaver pattern: accepts an IdentityPayload directly
-    rather than a CSV path, so the HTTP trigger can accept the same
-    {"payload": {...}} JSON body all three pipelines share.
-
-    run_pipeline() (CSV mode) is unchanged and still available for
-    run_local.py and batch processing.
+    Single-payload Joiner driver. Normalizes, then runs the shared stage
+    sequence. The HTTP trigger's entry point.
     """
     employee_id = payload.employee_id
     connection_string = os.environ.get("JML_STORAGE_CONNECTION_STRING", "")
-    mapping_rules_path = os.environ.get(
-        "JML_MAPPING_RULES_PATH", "config/role_mapping_rules.json"
-    )
-    lookup_path = os.environ.get(
-        "LOCAL_LOOKUP_PATH", "config/canonical_lookup.json"
-    )
     output_dir = os.environ.get("LOCAL_REPORT_DIR", "/tmp/jml_reports")
 
     hold_queue_client = get_hold_queue_table_client(connection_string)
     hold_queue = HoldQueueManager(AzureTableHoldQueueStore(hold_queue_client))
     events_client = get_events_table_client(connection_string)
 
-    lookup = load_lookup_table(lookup_path)
+    lookup = load_lookup_table(os.environ.get("LOCAL_LOOKUP_PATH", "config/canonical_lookup.json"))
     normalizer = Normalizer(lookup)
-
-    try:
-        mapping_rules = load_mapping_rules(mapping_rules_path)
-    except Exception as e:
-        logger.error(f"Failed to load mapping rules: {e}")
-        return {"final_status": "FAILED", "employee_id": employee_id, "summary": f"Mapping rules load failed: {e}"}
 
     report = DecisionReport(
         upn=payload.upn,
@@ -621,163 +475,32 @@ def run_joiner_pipeline(
         event=ReportEvent.JOINER,
     )
 
-    # Normalize
-    norm_result = normalizer.normalize(payload)
-    if not norm_result.passed:
+    norm = normalizer.normalize(payload)
+    if not norm.passed:
         report.normalization_status = NormalizationStatus.FAILED
         report.validation_status = ValidationStatus.SKIPPED
-        for reason in norm_result.failures:
+        for reason in norm.failures:
             report.add_hold_reason(reason)
-        hold_queue.create_from_normalization_failure(
-            payload=norm_result.payload, reasons=norm_result.failures,
-        )
+        hold_queue.create_from_normalization_failure(payload=norm.payload, reasons=norm.failures)
         _write_report_single(report, output_dir)
-        return {"final_status": "HELD", "employee_id": employee_id, "summary": f"Normalization failed: {norm_result.failures}"}
+        return {"final_status": "HELD", "employee_id": employee_id, "summary": f"Normalization failed: {norm.failures}"}
 
     report.normalization_status = NormalizationStatus.PASSED
-    normalised_payload = norm_result.payload
-
-    # Claim event
-    event_id = generate_event_id(
-        normalised_payload.employee_id,
-        normalised_payload.action.value,
-        normalised_payload.start_date.isoformat(),
-    )
-
-    payload_json = json.dumps({
-        "employee_id": normalised_payload.employee_id,
-        "upn": normalised_payload.upn,
-        "action": normalised_payload.action.value,
-        "start_date": normalised_payload.start_date.isoformat(),
-    })
-
-    claimed = claim_event(
-        table_client=events_client,
-        employee_id=normalised_payload.employee_id,
-        action=normalised_payload.action.value,
-        start_date=normalised_payload.start_date.isoformat(),
-        payload_json=payload_json,
-        correlation_id=event_id,
-    )
-
-    if not claimed:
-        return {"final_status": "DUPLICATE", "employee_id": employee_id, "event_id": event_id, "summary": "Duplicate event — already claimed in JmlEvents."}
-
-    # Conflict check
-    conflict_outcome = check_and_handle_conflict(
-        table_client=events_client,
-        employee_id=normalised_payload.employee_id,
-        new_event_id=event_id,
-        new_action=normalised_payload.action.value,
-    )
-
-    if conflict_outcome == ConflictOutcome.QUEUED:
-        _write_report_single(report, output_dir)
-        return {"final_status": "QUEUED", "employee_id": employee_id, "event_id": event_id, "summary": "Event queued — another event in progress for this employee."}
-
-    # Resolve entitlements
-    entitlements = resolve_entitlements(
-        rules=mapping_rules,
-        department=normalised_payload.department,
-        job_title=normalised_payload.job_title,
-        employment_type=normalised_payload.employment_type.value,
-        employee_id=normalised_payload.employee_id,
-    )
-
     report.add_action(
-        action="EntitlementsResolved",
-        detail=f"matched_rules={entitlements.matched_rule_ids}, access_packages={[ap.access_package_id for ap in entitlements.access_packages]}",
+        action="NormalizationPassed",
+        detail=f"department={norm.payload.department}, job_title={norm.payload.job_title}",
         succeeded=True,
     )
 
-    # Pre-provision validation
-    validation_result = pre_provision_validate(normalised_payload)
-
-    if not validation_result.passed:
-        report.validation_status = ValidationStatus.FAILED
-        for failure in validation_result.failure_summary():
-            report.add_hold_reason(failure)
-        hold_queue.create_from_validation_failure(
-            payload=normalised_payload, reasons=validation_result.failure_summary(),
-        )
-        update_event_status(
-            table_client=events_client, employee_id=normalised_payload.employee_id,
-            event_id=event_id, status=EventStatus.FAILED, failure_step="PreProvisionValidation",
-        )
-        _write_report_single(report, output_dir)
-        return {"final_status": "HELD", "employee_id": employee_id, "event_id": event_id, "summary": f"Pre-provision validation failed: {validation_result.failure_summary()}"}
-
-    report.validation_status = ValidationStatus.PASSED
-    for warning in validation_result.warning_summary():
-        report.add_warning(warning)
-
-    # Acquire lock and provision
-    instance_id = str(uuid.uuid4())
-    acquire_lock(events_client, normalised_payload.employee_id, event_id, instance_id)
-
-    provisioning_result = provision_joiner(
-        payload=normalised_payload,
-        entitlements=entitlements,
+    result = _execute_joiner_stages(
+        normalised_payload=norm.payload,
         report=report,
+        events_client=events_client,
         graph_client=graph_client,
-        event_status=EventStatus.PROCESSING,
-    )
-
-    if not provisioning_result.succeeded:
-        release_lock(events_client, normalised_payload.employee_id, event_id)
-        update_event_status(
-            table_client=events_client, employee_id=normalised_payload.employee_id,
-            event_id=event_id, status=EventStatus.FAILED,
-            failure_step=provisioning_result.failure_step,
-        )
-        release_next_queued_event(
-            table_client=events_client, employee_id=normalised_payload.employee_id,
-            predecessor_status=EventStatus.FAILED,
-        )
-        _write_report_single(report, output_dir)
-        return {"final_status": "FAILED", "employee_id": employee_id, "event_id": event_id, "summary": f"Provisioning failed at {provisioning_result.failure_step}: {provisioning_result.failure_detail}"}
-
-    # Post-provision validation
-    post_result = post_provision_validate(
-        entra_object_id=provisioning_result.entra_id,
-        employee_id=normalised_payload.employee_id,
-    )
-
-    if not post_result.passed:
-        report.validation_status = ValidationStatus.FAILED
-        release_lock(events_client, normalised_payload.employee_id, event_id)
-        update_event_status(
-            table_client=events_client, employee_id=normalised_payload.employee_id,
-            event_id=event_id, status=EventStatus.FAILED, failure_step="PostProvisionValidation",
-        )
-        _write_report_single(report, output_dir)
-        return {"final_status": "FAILED", "employee_id": employee_id, "event_id": event_id, "summary": f"Post-provision validation failed: {post_result.failure_summary()}"}
-
-    for warning in post_result.warning_summary():
-        report.add_warning(warning)
-
-    # Success
-    release_lock(events_client, normalised_payload.employee_id, event_id)
-    update_event_status(
-        table_client=events_client, employee_id=normalised_payload.employee_id,
-        event_id=event_id, status=EventStatus.COMPLETED,
-    )
-    release_next_queued_event(
-        table_client=events_client, employee_id=normalised_payload.employee_id,
-        predecessor_status=EventStatus.COMPLETED,
+        hold_queue=hold_queue,
     )
     _write_report_single(report, output_dir)
-
-    logger.info(f"Joiner pipeline complete — employee={employee_id}, entra_id={provisioning_result.entra_id}")
-
-    return {
-        "final_status": "COMPLETED",
-        "employee_id": employee_id,
-        "event_id": event_id,
-        "entra_id": provisioning_result.entra_id,
-        "summary": f"Joiner provisioning succeeded — {len(entitlements.access_packages)} package(s) assigned.",
-    }
-
+    return result
 
 def _write_report_single(report: DecisionReport, output_dir: str) -> None:
     """Write one audit report in single-payload mode."""
@@ -832,7 +555,7 @@ def main(req):
             from azure.data.tables import TableServiceClient
             table_client = TableServiceClient.from_connection_string(conn_str)
 
-            result = run_joiner_pipeline(
+            result = joiner_pipeline(
                 payload=payload,
                 table_client=table_client,
                 graph_client=graph_client,
