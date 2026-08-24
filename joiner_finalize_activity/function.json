@@ -1,0 +1,6 @@
+{
+  "scriptFile": "__init__.py",
+  "bindings": [
+    {"name": "combined", "type": "activityTrigger", "direction": "in"}
+  ]
+}

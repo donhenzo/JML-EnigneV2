@@ -1,0 +1,6 @@
+{
+  "scriptFile": "__init__.py",
+  "bindings": [
+    {"name": "payload_dict", "type": "activityTrigger", "direction": "in"}
+  ]
+}

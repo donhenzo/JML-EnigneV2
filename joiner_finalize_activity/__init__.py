@@ -1,0 +1,1 @@
+from Joiner.durable.activities import finalize as main

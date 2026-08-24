@@ -1,0 +1,1 @@
+from Joiner.durable.starter import start as main
