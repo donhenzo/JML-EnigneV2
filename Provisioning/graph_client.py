@@ -340,47 +340,56 @@ class JmlGraphClient:
         """
         Retrieve a user from Entra ID by UPN.
 
-        Returns a dict with id, upn, display_name, account_enabled,
-        department, and job_title.
+        Uses raw httpx against the Graph REST endpoint rather than the async
+        SDK — consistent with the rest of this client and avoids the SDK's
+        event-loop lifecycle problems on reused Azure Functions workers.
 
-        Raises UserNotFoundError if the UPN does not exist.
-        Raises GraphClientError on any other failure, with status_code set
-        so the retry decorator can classify it correctly.
+        Returns a dict with id, upn, display_name, account_enabled,
+        department, job_title. Raises UserNotFoundError on a clean 404.
         """
-        from msgraph.generated.users.item.user_item_request_builder import UserItemRequestBuilder
+        import httpx
+
+        if self._credential is None:
+            raise GraphClientError(
+                "No credential available for get_user HTTP call. "
+                "Ensure JmlGraphClient is constructed via build_graph_client()."
+            )
+
+        select = "id,userPrincipalName,displayName,accountEnabled,department,jobTitle"
+        endpoint = f"https://graph.microsoft.com/v1.0/users/{upn}?$select={select}"
 
         try:
-            query_params = UserItemRequestBuilder.UserItemRequestBuilderGetQueryParameters(
-                select=["id", "userPrincipalName", "displayName",
-                        "accountEnabled", "department", "jobTitle"]
-            )
-            request_config = UserItemRequestBuilder.UserItemRequestBuilderGetRequestConfiguration(
-                query_parameters=query_params
+            token = self._credential.get_token("https://graph.microsoft.com/.default")
+
+            response = httpx.get(
+                endpoint,
+                headers={"Authorization": f"Bearer {token.token}"},
+                timeout=30,
             )
 
-            user = self._run(
-                self._client.users.by_user_id(upn).get(
-                    request_configuration=request_config
-                )
-            )
-
-            if user is None:
+            if response.status_code == 404:
                 raise UserNotFoundError(f"User not found: {upn}", status_code=404)
 
+            if response.status_code != 200:
+                raise GraphClientError(
+                    f"get_user failed for {upn} — "
+                    f"status={response.status_code}, body={response.text[:300]}",
+                    status_code=response.status_code,
+                )
+
+            user = response.json()
             return {
-                "id":              user.id,
-                "upn":             user.user_principal_name,
-                "display_name":    user.display_name,
-                "account_enabled": user.account_enabled,
-                "department":      user.department,
-                "job_title":       user.job_title,
+                "id":              user.get("id"),
+                "upn":             user.get("userPrincipalName"),
+                "display_name":    user.get("displayName"),
+                "account_enabled": user.get("accountEnabled"),
+                "department":      user.get("department"),
+                "job_title":       user.get("jobTitle"),
             }
 
         except (UserNotFoundError, GraphClientError):
             raise
         except Exception as e:
-            if "not found" in str(e).lower() or "404" in str(e):
-                raise UserNotFoundError(f"User not found: {upn}", status_code=404)
             status_code = _extract_status_code(e)
             raise GraphClientError(f"get_user failed for {upn}: {e}", status_code=status_code)
 
@@ -389,49 +398,62 @@ class JmlGraphClient:
         """
         Create a new Entra ID user from a canonical IdentityPayload.
 
+        Uses raw httpx against the Graph REST endpoint rather than the async
+        SDK — consistent with the entitlement/PIM calls in this file, and
+        avoids the async event-loop lifecycle problems the SDK has on reused
+        Azure Functions workers ('Event loop is closed').
+
         Returns a dict with the new user's Entra object id and upn.
-        Group and role assignments are handled separately by the provisioner.
-
-        usage_location is hardcoded to "GB". Update if the tenant spans
-        multiple regions with different licensing requirements.
-
-        The temporary password is deterministic (derived from employee_id)
-        so a retry after a crash produces the same value. Must-change-on-
-        first-login is enforced, so this value is never long-lived.
-
-        Raises GraphClientError with status_code set. A 400 here typically
-        means an invalid UPN domain — the retry decorator will not retry it.
         """
+        import httpx
+
+        if self._credential is None:
+            raise GraphClientError(
+                "No credential available for create_user HTTP call. "
+                "Ensure JmlGraphClient is constructed via build_graph_client()."
+            )
+
+        temp_password = _generate_temp_password(payload.employee_id)
+
+        body = {
+            "displayName":       payload.display_name,
+            "userPrincipalName": payload.upn,
+            "mailNickname":      payload.upn.split("@")[0],
+            "accountEnabled":    True,
+            "jobTitle":          payload.job_title,
+            "department":        payload.department,
+            "employeeId":        payload.employee_id,
+            "usageLocation":     "GB",
+            "employeeType":      payload.employment_type.value,
+            "passwordProfile": {
+                "password":                      temp_password,
+                "forceChangePasswordNextSignIn": True,
+            },
+        }
+
         try:
-            temp_password = _generate_temp_password(payload.employee_id)
+            token = self._credential.get_token("https://graph.microsoft.com/.default")
 
-            user                     = User()
-            user.display_name        = payload.display_name
-            user.user_principal_name = payload.upn
-            user.mail_nickname       = payload.upn.split("@")[0]
-            user.account_enabled     = True
-            user.job_title           = payload.job_title
-            user.department          = payload.department
-            user.employee_id         = payload.employee_id
-            user.usage_location      = "GB"
-            user.employee_type       = payload.employment_type.value
+            response = httpx.post(
+                "https://graph.microsoft.com/v1.0/users",
+                headers={
+                    "Authorization": f"Bearer {token.token}",
+                    "Content-Type":  "application/json",
+                },
+                json=body,
+                timeout=30,
+            )
 
-            password_profile                                     = PasswordProfile()
-            password_profile.password                            = temp_password
-            password_profile.force_change_password_next_sign_in = True
-            user.password_profile                                = password_profile
-
-            created = self._run(self._client.users.post(user))
-
-            if created is None:
+            if response.status_code not in (200, 201):
                 raise GraphClientError(
-                    f"create_user returned None for {payload.upn} — "
-                    "Graph API call may have succeeded but returned no object. "
-                    "Check Entra ID before retrying."
+                    f"create_user failed for {payload.upn} — "
+                    f"status={response.status_code}, body={response.text[:300]}",
+                    status_code=response.status_code,
                 )
 
-            logger.info(f"User created — upn={payload.upn}, object_id={created.id}")
-            return {"id": created.id, "upn": created.user_principal_name}
+            created = response.json()
+            logger.info(f"User created — upn={payload.upn}, object_id={created.get('id')}")
+            return {"id": created.get("id"), "upn": created.get("userPrincipalName")}
 
         except GraphClientError:
             raise
@@ -439,7 +461,7 @@ class JmlGraphClient:
             status_code = _extract_status_code(e)
             raise GraphClientError(
                 f"create_user failed for {payload.upn}: {e}",
-                status_code=status_code
+                status_code=status_code,
             )
 
     @retry_on_throttle(max_retries=3, base_backoff=2.0)
