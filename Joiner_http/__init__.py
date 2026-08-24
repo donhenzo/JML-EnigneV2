@@ -64,7 +64,6 @@ from pathlib import Path
 from Ingestion.schema import IdentityPayload, EmploymentType, JmlAction
 from Normalization.lookup_loader import load_lookup_table
 from Normalization.normalizer import Normalizer
-from Hold_queue.models import HoldStatus
 from Hold_queue.queue_manager import HoldQueueManager
 from Hold_queue.azure_table_hold_queue_store import (
     AzureTableHoldQueueStore,
@@ -82,21 +81,17 @@ from Mapping.mapping_loader import load_mapping_rules
 from Mapping.mapping_resolver import resolve_entitlements
 from Functions.Event_store.event_store import (
     get_events_table_client,
-    generate_event_id,
-    claim_event,
     acquire_lock,
     release_lock,
     update_event_status,
-    check_active_event,
     EventStatus,
 )
 from Functions.Event_store.conflict_queue import (
-    check_and_handle_conflict,
     ConflictOutcome,
     release_next_queued_event,
 )
 
-from Provisioning.provisioner import provision_joiner
+
 from Provisioning.graph_client import build_graph_client, JmlGraphClient
 from Audit.run_summary_writer import write_run_summary
 
