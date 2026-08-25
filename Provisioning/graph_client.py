@@ -464,132 +464,197 @@ class JmlGraphClient:
                 status_code=status_code,
             )
 
-    @retry_on_throttle(max_retries=3, base_backoff=2.0)
-    def get_group(self, group_id: str) -> dict:
-        """
-        Retrieve a group by object ID.
 
-        Returns group details including is_dynamic — the provisioner uses
-        this to skip manual membership assignment for dynamic groups.
+    @retry_on_throttle(max_retries=3, base_backoff=2.0)
+    def patch_user(self, user_id: str, attributes: dict) -> None:
+        """
+        PATCH mutable attributes onto an existing Entra ID user (Mover Step 7).
+
+        Uses raw httpx against the Graph REST endpoint rather than the async
+        SDK — consistent with create_user/get_user, and avoids the SDK's
+        event-loop lifecycle problems on reused Azure Functions workers
+        ('Event loop is closed').
+
+        attributes keys are Graph REST user property names (department,
+        jobTitle, officeLocation, employeeType). The caller excludes fields
+        that need a different endpoint (manager) or a value transform
+        (usageLocation). An empty dict is a no-op.
 
         Raises GraphClientError with status_code set.
         """
+        import httpx
+
+        if not attributes:
+            return
+
+        if self._credential is None:
+            raise GraphClientError(
+                "No credential available for patch_user HTTP call. "
+                "Ensure JmlGraphClient is constructed via build_graph_client()."
+            )
+
+        endpoint = f"https://graph.microsoft.com/v1.0/users/{user_id}"
+
         try:
-            group = self._run(self._client.groups.by_group_id(group_id).get())
+            token = self._credential.get_token("https://graph.microsoft.com/.default")
 
-            if group is None:
-                raise GraphClientError(f"Group not found: {group_id}", status_code=404)
+            response = httpx.patch(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {token.token}",
+                    "Content-Type":  "application/json",
+                },
+                json=attributes,
+                timeout=30,
+            )
 
-            return {
-                "id":              group.id,
-                "display_name":    group.display_name,
-                "membership_rule": group.membership_rule,
-                "is_dynamic":      bool(group.membership_rule),
-            }
+            if response.status_code not in (200, 204):
+                raise GraphClientError(
+                    f"patch_user failed for {user_id} — "
+                    f"status={response.status_code}, body={response.text[:300]}",
+                    status_code=response.status_code,
+                )
+
+            logger.info(
+                "User attributes patched — user_id=%s, fields=%s",
+                user_id, list(attributes.keys()),
+            )
 
         except GraphClientError:
             raise
         except Exception as e:
             status_code = _extract_status_code(e)
             raise GraphClientError(
-                f"get_group failed for {group_id}: {e}",
-                status_code=status_code
+                f"patch_user failed for {user_id}: {e}",
+                status_code=status_code,
             )
 
-    @retry_on_throttle(max_retries=3, base_backoff=2.0)
-    def check_group_membership(self, user_id: str, group_id: str) -> bool:
-        """
-        Return True if the user is already a member of the group.
+        @retry_on_throttle(max_retries=3, base_backoff=2.0)
+        def get_group(self, group_id: str) -> dict:
+            """
+            Retrieve a group by object ID.
 
-        Always called before add_group_member() to keep assignment idempotent.
-        Raises GraphClientError with status_code set.
-        """
-        try:
-            members = self._run(
-                self._client.groups.by_group_id(group_id).members.get()
-            )
+            Returns group details including is_dynamic — the provisioner uses
+            this to skip manual membership assignment for dynamic groups.
 
-            if members and members.value:
-                for member in members.value:
-                    if member.id == user_id:
-                        return True
-            return False
+            Raises GraphClientError with status_code set.
+            """
+            try:
+                group = self._run(self._client.groups.by_group_id(group_id).get())
 
-        except GraphClientError:
-            raise
-        except Exception as e:
-            status_code = _extract_status_code(e)
-            raise GraphClientError(
-                f"check_group_membership failed — user={user_id}, group={group_id}: {e}",
-                status_code=status_code
-            )
+                if group is None:
+                    raise GraphClientError(f"Group not found: {group_id}", status_code=404)
 
-    @retry_on_throttle(max_retries=3, base_backoff=2.0)
-    def add_group_member(self, user_id: str, group_id: str) -> None:
-        """
-        Add a user to an Entra ID group.
+                return {
+                    "id":              group.id,
+                    "display_name":    group.display_name,
+                    "membership_rule": group.membership_rule,
+                    "is_dynamic":      bool(group.membership_rule),
+                }
 
-        Only called after check_group_membership() confirms the user is
-        not already a member. Does not guard against duplicates itself.
-        Raises GraphClientError with status_code set.
-        """
-        try:
-            ref          = ReferenceCreate()
-            ref.odata_id = (
-                f"https://graph.microsoft.com/v1.0/directoryObjects/{user_id}"
-            )
+            except GraphClientError:
+                raise
+            except Exception as e:
+                status_code = _extract_status_code(e)
+                raise GraphClientError(
+                    f"get_group failed for {group_id}: {e}",
+                    status_code=status_code
+                )
 
-            self._run(
-                self._client.groups.by_group_id(group_id).members.ref.post(ref)
-            )
+        @retry_on_throttle(max_retries=3, base_backoff=2.0)
+        def check_group_membership(self, user_id: str, group_id: str) -> bool:
+            """
+            Return True if the user is already a member of the group.
 
-            logger.info(f"Group member added — user={user_id}, group={group_id}")
+            Always called before add_group_member() to keep assignment idempotent.
+            Raises GraphClientError with status_code set.
+            """
+            try:
+                members = self._run(
+                    self._client.groups.by_group_id(group_id).members.get()
+                )
 
-        except GraphClientError:
-            raise
-        except Exception as e:
-            status_code = _extract_status_code(e)
-            raise GraphClientError(
-                f"add_group_member failed — user={user_id}, group={group_id}: {e}",
-                status_code=status_code
-            )
+                if members and members.value:
+                    for member in members.value:
+                        if member.id == user_id:
+                            return True
+                return False
 
-    @retry_on_throttle(max_retries=3, base_backoff=2.0)
-    def check_rbac_assignment(
-        self,
-        user_id: str,
-        role_definition_id: str,
-        scope: str
-    ) -> bool:
-        """
-        Return True if the RBAC role assignment already exists for this user.
+            except GraphClientError:
+                raise
+            except Exception as e:
+                status_code = _extract_status_code(e)
+                raise GraphClientError(
+                    f"check_group_membership failed — user={user_id}, group={group_id}: {e}",
+                    status_code=status_code
+                )
 
-        Always called before create_rbac_assignment() to prevent duplicate
-        assignments on retry.
-        Raises GraphClientError with status_code set.
-        """
-        try:
-            assignments = self._run(
-                self._client.role_management.directory.role_assignments.get()
-            )
+        @retry_on_throttle(max_retries=3, base_backoff=2.0)
+        def add_group_member(self, user_id: str, group_id: str) -> None:
+            """
+            Add a user to an Entra ID group.
 
-            if assignments and assignments.value:
-                for assignment in assignments.value:
-                    if (
-                        assignment.principal_id       == user_id
-                        and assignment.role_definition_id == role_definition_id
-                    ):
-                        return True
-            return False
+            Only called after check_group_membership() confirms the user is
+            not already a member. Does not guard against duplicates itself.
+            Raises GraphClientError with status_code set.
+            """
+            try:
+                ref          = ReferenceCreate()
+                ref.odata_id = (
+                    f"https://graph.microsoft.com/v1.0/directoryObjects/{user_id}"
+                )
 
-        except GraphClientError:
-            raise
-        except Exception as e:
-            status_code = _extract_status_code(e)
-            raise GraphClientError(
-                f"check_rbac_assignment failed — user={user_id}: {e}",
-                status_code=status_code
-            )
+                self._run(
+                    self._client.groups.by_group_id(group_id).members.ref.post(ref)
+                )
+
+                logger.info(f"Group member added — user={user_id}, group={group_id}")
+
+            except GraphClientError:
+                raise
+            except Exception as e:
+                status_code = _extract_status_code(e)
+                raise GraphClientError(
+                    f"add_group_member failed — user={user_id}, group={group_id}: {e}",
+                    status_code=status_code
+                )
+
+        @retry_on_throttle(max_retries=3, base_backoff=2.0)
+        def check_rbac_assignment(
+            self,
+            user_id: str,
+            role_definition_id: str,
+            scope: str
+        ) -> bool:
+            """
+            Return True if the RBAC role assignment already exists for this user.
+
+            Always called before create_rbac_assignment() to prevent duplicate
+            assignments on retry.
+            Raises GraphClientError with status_code set.
+            """
+            try:
+                assignments = self._run(
+                    self._client.role_management.directory.role_assignments.get()
+                )
+
+                if assignments and assignments.value:
+                    for assignment in assignments.value:
+                        if (
+                            assignment.principal_id       == user_id
+                            and assignment.role_definition_id == role_definition_id
+                        ):
+                            return True
+                return False
+
+            except GraphClientError:
+                raise
+            except Exception as e:
+                status_code = _extract_status_code(e)
+                raise GraphClientError(
+                    f"check_rbac_assignment failed — user={user_id}: {e}",
+                    status_code=status_code
+                )
 
     @retry_on_throttle(max_retries=3, base_backoff=2.0)
     def create_rbac_assignment(
