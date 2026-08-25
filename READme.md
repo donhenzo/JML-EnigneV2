@@ -16,27 +16,21 @@ The complete **Joiner → Mover → Leaver** lifecycle has been tested end-to-en
 
 A Joiner starts with an HR record and no existing identity.
 
-```text
-HR Record
-   ↓
-Canonical Identity
-   ↓
-Entitlement Resolution
-   ↓
-Governance Validation
-   ↓
-Create Entra Identity
-   ↓
-Assign Access Packages
-   ↓
-Poll Until Delivered
-   ↓
-Verify Tenant State
-   ↓
-Audit
+```mermaid
+flowchart TD
+    HR["HR Record"] --> CI["Canonical Identity"]
+    CI --> ER["Entitlement Resolution"]
+    ER --> GV["Governance Validation"]
+    GV --> CU["Create Entra Identity"]
+    CU --> SUB["Submit Access Package Requests"]
+    SUB --> POLL["Poll for Delivery<br/>orchestrator-driven durable timer loop"]
+    POLL --> VER["Verify Tenant State"]
+    VER --> AUD["Audit"]
 ```
 
 Entitlements are resolved from policy using attributes such as department, job title, and employment type. The resulting Access Packages can deliver access to Microsoft 365 resources and downstream applications through SCIM.
+
+The Joiner runs as an Azure Durable Functions orchestration: the HTTP call returns immediately, and entitlement delivery is polled through durable timers rather than a blocking wait. This removes the gateway-timeout ceiling on long deliveries — a Joiner whose packages take several minutes to deliver completes cleanly instead of being cut off.
 
 ### Mover
 
@@ -58,10 +52,11 @@ The critical property is **add-before-remove**.
 
 If the new access cannot be delivered, the old access is not removed.
 
-```text
-Current Access ─────┐
-                    ├──→ Delta ──→ Add ──→ Verify ──→ Remove
-Target Access ──────┘
+```mermaid
+flowchart LR
+    CUR["Current Access"] --> DELTA["Delta"]
+    TGT["Target Access"] --> DELTA
+    DELTA --> ADD["Add"] --> VER["Verify"] --> REM["Remove"]
 ```
 
 ### Leaver
@@ -70,24 +65,16 @@ Offboarding follows a different safety model.
 
 The account is disabled and sessions are revoked **before** access cleanup begins.
 
-```text
-Leaver Event
-   ↓
-Claim Event
-   ↓
-Disable Account
-   ↓
-Revoke Sessions
-   ↓
-Remove All Access Packages
-   ↓
-Terminate Active PIM Sessions
-   ↓
-Soft Delete
-   ↓
-Verify Offboarding
-   ↓
-Audit
+```mermaid
+flowchart TD
+    LE["Leaver Event"] --> CE["Claim Event"]
+    CE --> DIS["Disable Account"]
+    DIS --> REV["Revoke Sessions"]
+    REV --> REM["Remove All Access Packages"]
+    REM --> PIM["Terminate Active PIM Sessions"]
+    PIM --> SD["Soft Delete"]
+    SD --> VO["Verify Offboarding"]
+    VO --> AUD["Audit"]
 ```
 
 The Leaver does not attempt to calculate what the user *should* have. It removes what the user currently holds.
@@ -118,18 +105,13 @@ Privileged access is represented explicitly in the entitlement model rather than
 
 A governance failure blocks the lifecycle event.
 
-```text
-HR Event
-   ↓
-Normalize Identity
-   ↓
-Resolve Entitlements
-   ↓
-Governance Validation
-   │
-   ├── PASS ──→ Microsoft Graph
-   │
-   └── FAIL ──→ Hold Queue
+```mermaid
+flowchart TD
+    HE["HR Event"] --> NI["Normalize Identity"]
+    NI --> RE["Resolve Entitlements"]
+    RE --> GV["Governance Validation"]
+    GV -->|Pass| MG["Microsoft Graph"]
+    GV -->|Fail| HQ["Hold Queue"]
 ```
 
 A failed Joiner or Mover therefore does not create an identity or modify access.
@@ -161,10 +143,23 @@ flowchart TD
 
     EM --> POLL["Delivery Polling"]
     POLL --> VERIFY["Tenant State Verification"]
-    VERIFY --> AUDIT["Immutable Audit"]
+    VERIFY --> AUDIT["Audit"]
     HOLD --> AUDIT
+```
 
 The execution layer is deliberately separated from the governance decision.
+
+### Execution Model — Durable Migration Status
+
+Long-running entitlement delivery is being migrated to Azure Durable Functions, so that polling waits are orchestrator-driven timers rather than blocking calls bound by the HTTP gateway timeout. The migration is per-pipeline:
+
+| Pipeline   | Execution Model                          | Status      |
+| ---------- | ---------------------------------------- | ----------- |
+| **Joiner** | Durable Functions — timer-driven polling | ✅ Complete  |
+| **Mover**  | Synchronous                              | 🚧 Planned  |
+| **Leaver** | Synchronous                              | 🚧 Planned  |
+
+Each pipeline also retains a synchronous execution path, used by the CSV/local runner alongside its HTTP entry point.
 
 ---
 
@@ -190,7 +185,6 @@ The important part is that this is not only a policy simulation. The workflows e
 * Governance-first Joiner, Mover, and Leaver automation
 * Microsoft Entra Entitlement Management Access Packages
 * Policy-driven entitlement resolution using JSON configuration
-* Separation of Duties enforcement
 * Add-before-remove Mover sequencing
 * Disable-before-remove Leaver sequencing
 * Active PIM session termination during offboarding
@@ -201,7 +195,8 @@ The important part is that this is not only a policy simulation. The workflows e
 * Post-offboarding verification
 * Deterministic and idempotent event processing
 * SHA-256 event identity and atomic event claiming
-* Immutable per-event audit records
+* Per-event audit records (written once by the engine; storage-enforced immutability planned)
+* Durable Functions orchestration for the Joiner (timer-driven entitlement polling)
 * BambooHR ingestion
 * CSV offline execution
 * Direct HTTP lifecycle event ingestion
@@ -219,6 +214,7 @@ The important part is that this is not only a policy simulation. The workflows e
 | ----------------------- | -------------------------------------------------- |
 | Runtime                 | Python 3.11                                        |
 | Compute                 | Azure Functions — Flex Consumption                 |
+| Orchestration           | Azure Durable Functions (Joiner)                   |
 | Identity                | Microsoft Entra ID                                 |
 | API                     | Microsoft Graph                                    |
 | Governance              | Entra Identity Governance / Entitlement Management |
@@ -250,7 +246,9 @@ The important part is that this is not only a policy simulation. The workflows e
 * Event idempotency and concurrency control
 * Conflict handling and Leaver supersede
 * Tenant-state verification
-* Immutable audit reporting
+* Per-event audit reporting
+* Durable Functions execution for the Joiner (timer-driven entitlement polling)
+* Synthetic identity ID for pre-provision governance (payload side)
 * BambooHR ingestion
 * CSV execution
 * Direct HTTP lifecycle events
@@ -260,15 +258,16 @@ The important part is that this is not only a policy simulation. The workflows e
 
 ### In Progress / Planned
 
-* Durable Functions migration for long-running entitlement polling
-* Synthetic identity validation for pre-provision governance checks
+* Durable Functions migration for Mover and Leaver (Joiner complete)
+* Synthetic identity consumption in the validation engine (re-coupling)
 * Last-state store for webhook-driven lifecycle processing
 * BambooHR webhook ingestion
 * Event-store recovery/reclaim
 * Reconciliation pipeline
 * Resumable Leaver recovery
 * Entra Entitlement Management approval workflow integration
-* Platform-enforced incompatible Access Package handling
+* Separation of Duties enforcement (platform-level, via Access Package incompatibilities — ADR-008)
+* Platform-enforced incompatible Access Package pre-flight check (ADR-011)
 * Salesforce SCIM integration
 
 ---
@@ -336,6 +335,8 @@ The same pattern is available for:
 /api/mover
 /api/leaver
 ```
+
+The Joiner additionally exposes a Durable Functions endpoint, `/api/joiner-durable`, which returns `202 Accepted` with a status URL and runs the pipeline as an orchestration. The synchronous `/api/joiner` endpoint remains available.
 
 This provides the interface required for eventual HR webhook integration.
 

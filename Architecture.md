@@ -25,7 +25,7 @@
 
 ## 1. System Overview
 
-This engine automates the identity lifecycle — Joiner, Mover, Leaver — for Microsoft Entra ID. Most provisioning systems create the identity first and check the access afterwards, in an access review or a certification cycle weeks later. This engine reverses that order. Policy resolution and governance validation run *before* any Microsoft Graph write. If a record fails policy, nothing is created and nothing is changed. Every decision — pass or fail — is written as immutable audit evidence at the moment it happens, not reconstructed from logs during an audit.
+This engine automates the identity lifecycle — Joiner, Mover, Leaver — for Microsoft Entra ID. Most provisioning systems create the identity first and check the access afterwards, in an access review or a certification cycle weeks later. This engine reverses that order. Policy resolution and governance validation run *before* any Microsoft Graph write. If a record fails policy, nothing is created and nothing is changed. Every decision — pass or fail — is written as a per-event audit record at the moment it happens, not reconstructed from logs during an audit. (Write-once immutable storage for those records is planned, not yet in place — §9, §11.)
 
 Access is delivered through Entra ID Entitlement Management Access Packages, never through direct group assignment (ADR-007). This is the single most consequential decision in the system. The engine reasons about packages; Entra delivers the groups, licences, and roles bundled inside them. A rule resolves to an `accessPackageId` and a `policyId`, an assignment request is submitted and polled to delivery, and group membership is a downstream consequence the engine never touches directly.
 
@@ -39,7 +39,7 @@ Joiner and Mover share almost the entire pipeline and diverge only in the middle
 
 The stack is Microsoft-native throughout. Python 3.11 on Azure Functions orchestrates the flow, Microsoft Graph is the only execution interface, Azure Table Storage holds event and audit state, and a separately deployed PowerShell function runs governance validation over HTTP. HR events come from BambooHR live or from CSV for offline testing.
 
-All three lifecycle branches are implemented and have run end to end against a live Entra ID tenant. The governance validation engine is currently decoupled at the HTTP boundary for independent testing and is reintegrated when the pipeline moves to Azure. Azure deployment with CI/CD and a Durable Functions migration are planned, not built. Section 12 (Architectural Boundaries) and Section 13 (Future Evolution) state exactly where those lines fall.
+All three lifecycle branches are implemented and have run end to end against a live Entra ID tenant. The engine is deployed to Azure Functions (Flex Consumption) through a GitHub Actions CI/CD pipeline authenticated by OIDC; every change is tested against the tenant on the local Functions runtime first, then deployed. The Joiner's provisioning runs as an Azure Durable Functions orchestration in that deployment — its delivery poll is an orchestrator-driven timer loop rather than a blocking wait — while the Mover and Leaver are still synchronous and await the same migration. Several productionization pieces remain deliberately unbuilt: authentication is still Microsoft Graph client credentials in both environments (Managed Identity is not yet adopted), the governance validation engine is decoupled at the HTTP boundary and skipped in current runs until it is itself deployed, and Joiner audit reports are written as local JSON rather than to immutable blob storage. This is an honest middle state — live in Azure, but with productionization still in progress — and Section 11 (Azure Deployment), Section 12 (Architectural Boundaries), and Section 13 (Future Evolution) state exactly where each line falls.
 
 ---
 
@@ -75,7 +75,7 @@ flowchart TD
     GOV["Governance<br/>SoD · validation gate"]
     PROV["Provisioning<br/>Graph · Entitlement Management"]
     VER["Verification<br/>real tenant state"]
-    AUD["Audit<br/>immutable per-event report"]
+    AUD["Audit<br/>per-event report"]
 
     HR --> ING --> NORM --> EVT --> POL --> GOV --> PROV --> VER --> AUD
 
@@ -126,7 +126,9 @@ The Joiner pipeline runs as an ordered sequence of stages. A record only reaches
 7. **Access Package assignment.** The engine submits an Access Package assignment request for each resolved package.
 8. **Delivery polling.** Each assignment request is polled to a terminal delivery state before the pipeline considers the assignment complete.
 9. **Post-provision verification.** The real, now-provisioned Entra ID object is checked against the intended entitlement set.
-10. **Audit report.** A structured, immutable report is written for the event regardless of outcome, and the Event Store lock is released.
+10. **Audit report.** A structured report is written for the event regardless of outcome, and the Event Store lock is released.
+
+In the deployed Azure runtime, stages 6 through 10 execute as an Azure Durable Functions orchestration rather than one blocking call. The HTTP entry point returns `202 Accepted` immediately with a status URL, and an orchestrator drives the sequence — create user, wait for user propagation on a durable timer, submit the package requests, then poll delivery through a check-activity-and-timer loop before recording and finalizing. The two waits that were `time.sleep` calls in the synchronous path (user propagation and the delivery poll interval) become orchestrator timers that hold no compute, so a delivery that takes minutes completes rather than being cut off at the gateway timeout. The synchronous Joiner path is retained alongside the durable one; §7.8 covers the orchestration in full. The Mover and Leaver remain synchronous pending the same migration.
 
 Separation of Duties is not a stage on this path. SoD enforcement is planned as a platform-level control in Entra Entitlement Management (§5.4), not a Python check inside the pipeline. When configured, a conflicting assignment surfaces as a `Denied` request state during delivery polling (stage 8) rather than as a separate gate before provisioning.
 
@@ -180,7 +182,7 @@ The Joiner pipeline depends on, but does not redefine:
 - **Governance validation** — for the pre-provision gate (§5.3).
 - **Provisioning** — for user creation, package assignment, and delivery polling (§7).
 - **Post-provision verification** — for confirming the real tenant state after assignment (§7).
-- **Audit** — for the immutable per-event report (§9).
+- **Audit** — for the per-event report (§9).
 
 ---
 
@@ -614,7 +616,7 @@ Microsoft Graph is the sole execution interface, accessed through a single clien
 
 ### 4.7 Audit
 
-Every event produces exactly one immutable record, written at the time of processing regardless of outcome, and never modified afterwards. The three pipelines write three record types — `DecisionReport` for the Joiner, `MoverAuditRecord` for the Mover, `LeaverAuditRecord` for the Leaver — but the contract is identical: capture every action taken, every rule that fired, every warning, and the final verification result, with enough detail that a partial failure produces a precise record of what succeeded before it. Section 9 covers the record shapes and the storage model.
+Every event produces exactly one record, written at the time of processing regardless of outcome, and written once by the engine's own logic. The three pipelines write three record types — `DecisionReport` for the Joiner, `MoverAuditRecord` for the Mover, `LeaverAuditRecord` for the Leaver — but the contract is identical: capture every action taken, every rule that fired, every warning, and the final verification result, with enough detail that a partial failure produces a precise record of what succeeded before it. Storage-enforced immutability (write-once blob with a retention policy) is planned but not yet in place. Section 9 covers the record shapes and the current storage model.
 
 ---
 
@@ -807,7 +809,7 @@ The client uses two calling styles depending on what the SDK models well:
 
 The client also owns three exception types — `GraphClientError`, `UserNotFoundError`, and `GraphThrottlingError` — so nothing above it ever catches an SDK-specific exception or inspects a raw HTTP status. `UserNotFoundError` is kept distinct from a general error specifically so the pipeline can tell a clean `404` (the UPN doesn't exist yet, which on a Joiner is the normal case) from a real failure without parsing exception text.
 
-Authentication is the one line that changes between environments. Locally the client builds a `ClientSecretCredential` from `local.settings.json`; in Azure it becomes a Managed Identity credential. Nothing else in the provisioning layer moves — the credential is constructed in one place and injected.
+Authentication is the one line intended to change between environments, though today it does not. The client builds a `ClientSecretCredential` — from `local.settings.json` locally, and from application settings in the deployed Azure app — so client credentials are used in both environments for now. Managed Identity is the planned replacement (§11); the credential is constructed in a single place and injected, so that swap will be confined to one function and nothing else in the provisioning layer moves.
 
 ### 7.2 Retry and Throttling
 
@@ -865,9 +867,23 @@ The `assignments` resource (with its `state` field) and the `assignmentRequests`
 
 A `2xx` from Graph means the request was accepted. It does not mean the access exists. This distinction is the reason every pipeline ends with a verification step that re-fetches the real object: the Joiner confirms the provisioned user holds the intended packages, the Mover confirms the post-move assignment set matches the expected state, and the Leaver confirms the account is actually disabled and its packages actually cleared. Provisioning is only complete when the tenant says so, not when the API call returns.
 
-### 7.8 The Path to Azure — a Durable Handoff
+### 7.8 The Durable Orchestration — Implemented for the Joiner
 
-The submit-then-poll split is not just a loop; it is a seam designed for the move to Azure. Today the poll runs inline in a single synchronous execution, which is fine for local runs but ties up a function for as long as delivery takes. The `PendingPackage` record is deliberately the exact shape that would persist to Table Storage between runs, so the split can become an asynchronous handoff: the submit phase stays in the HTTP-triggered function, the poll phase moves to a Timer Trigger or Durable Function, and the pending list survives between them. That same handoff is what the deferred Leaver soft-delete needs — a timer that returns later to finish work the first execution intentionally left pending. Section 13 covers the Durable Functions migration this enables; the point here is that the provisioning layer is already shaped for it.
+The submit-then-poll split was never just a loop; it is the seam the Durable Functions migration was designed around, and for the Joiner that migration is now built and deployed. The Joiner's provisioning runs as an Azure Durable Functions orchestration rather than one blocking synchronous call.
+
+The mechanism is a decomposition of the provisioning phases into sleep-free functions, driven by an orchestrator that owns every wait as a durable timer. Where the synchronous path called `time.sleep`, the orchestration yields a timer that holds no compute:
+
+```
+pre_provision → create_user → timer(user propagation) → submit_packages →
+   loop (bounded): check_packages → all terminal? break : timer(poll interval) →
+record_and_finalize (record results → post-provision verify → finalize)
+```
+
+Each stage is a Durable *activity*; the orchestrator is the conductor. State crosses every activity boundary as plain serializable data — the `PendingPackage` record, deliberately built from scalar fields only, moves between the submit and check activities as a dictionary and reconstructs on the other side. The HTTP entry point (`joiner-durable`) is a thin starter that returns `202 Accepted` with a status URL and hands off to the orchestrator; the caller never blocks on delivery. Because the two waits are timers rather than blocking calls, a delivery that takes several minutes completes cleanly — a duration that would previously have exceeded the HTTP gateway timeout and failed now simply runs to completion while the orchestrator sleeps between polls.
+
+The provisioning phase functions are shared, not duplicated: the synchronous `provision_joiner` composes them with `time.sleep`, and the orchestrator composes the same functions with timers. This is why the synchronous Joiner path can be retained unchanged alongside the durable one — both call one implementation, differing only in who owns the waiting.
+
+Two things remain on this seam. The **Mover and Leaver** still run their submit-then-poll (and, for the Leaver, its remove-and-poll) inline and synchronously; they await the same decomposition, and they are the pipelines that most need it, since their polling volume is higher. And the **deferred Leaver soft-delete** wants exactly the kind of background timer this orchestration model provides — a timer that returns later to finish work the first execution intentionally left pending — which it does not yet have (§7 of the Leaver, §11, §13).
 
 ### 7.9 Permissions
 
@@ -967,7 +983,7 @@ None of the destinations above see a failure the tenant would have recovered fro
 
 ## 9. Audit Architecture
 
-Every event produces exactly one record, written at the time of processing, regardless of outcome. That record is the authoritative evidence for what the engine did — not a log to be pieced together afterwards, but a structured document produced at the moment the decision was made. A missing report is treated as an audit gap: the report is written before the function returns, it is never modified, and it is never deleted.
+Every event produces exactly one record, written at the time of processing, regardless of outcome. That record is the authoritative evidence for what the engine did — not a log to be pieced together afterwards, but a structured document produced at the moment the decision was made. A missing report is treated as an audit gap: the report is written before the function returns, and the engine never rewrites it. Storage-enforced immutability — a write-once blob container with a retention policy, so the record cannot be altered even outside the engine — is designed but not yet in place; the current storage model and what it does and does not guarantee are stated plainly in §9.6.
 
 ### 9.1 The Audit Contract
 
@@ -975,7 +991,7 @@ Three properties define the contract, and they hold for every lifecycle branch:
 
 **Written regardless of outcome.** A success, a hold, and a failure all produce a report. There is no path through the engine that completes without leaving one behind.
 
-**Written once, never modified.** Each report is a distinct file or row with a unique, timestamped identity. The blob writer sets `overwrite=False` explicitly, and the production container is expected to carry an immutability policy — the storage layer refuses to overwrite an audit record, it does not merely decline to. Reports are append-only and restricted to the engine's Managed Identity and authorised auditors.
+**Written once by the engine.** Each report is a distinct file or row with a unique, timestamped identity, and the engine's own code never rewrites it. Storage-*enforced* immutability is a further step that is planned rather than built: the intended production design writes each `DecisionReport` to a blob with `overwrite=False` in a container carrying a retention/immutability policy, so the storage layer itself refuses to overwrite a record. Today the Joiner's reports are written as local JSON files, which carry no such guarantee — §9.6 states exactly where records land now and where the immutability gap is.
 
 **Traceable to policy.** Because every resolved entitlement carries the rule ID that produced it (§5.2), the report answers not just *what* access was granted but *which policy* granted it. Evidence is produced at provisioning time, so an auditor never has to reconstruct intent from group memberships and platform logs.
 
@@ -997,7 +1013,7 @@ The Joiner writes a `DecisionReport`, a structured document with three groups of
 
 Two of the status enums carry more meaning than a plain pass/fail. `validation_status` defaults to `Skipped`, and that value is load-bearing: a record held *before* validation ran is `Skipped`, not `Failed` — the report distinguishes "the gate said no" from "the record never reached the gate." Similarly `normalization_status` has a `PartialHold` value for the case where some fields resolved and others didn't. The report captures not just the verdict but where in the pipeline the verdict was reached.
 
-Storage is one file per event. Locally that's `{employee_id}_{event}_{timestamp}.json` in the output directory; in production it's a blob under `reports/{year}/{month}/`, written with `overwrite=False` through a Managed Identity credential. The filename is unique and time-sortable by construction, so reports never collide and a directory listing browses in chronological order.
+Storage is one file per event: `{employee_id}_{event}_{timestamp}.json`, written to the output directory as local JSON — this is what runs today, in both local and deployed execution. The planned production form writes the same document to a blob under `reports/{year}/{month}/` with `overwrite=False` and an immutability policy (§9.6, §11); that blob path is not yet wired. The filename is unique and time-sortable by construction, so reports never collide and a directory listing browses in chronological order.
 
 ### 9.4 The Mover and Leaver Records
 
@@ -1038,7 +1054,7 @@ The **Leaver audit record** (to `LeaverAuditLog`) carries:
 | `warnings` | PIM permission gaps, deferred soft delete, partial removal failures |
 | `offboard_status` | Terminal: `OFFBOARD_SUCCESS` / `OFFBOARD_PARTIAL` / `OFFBOARD_FAILED` |
 
-The shapes differ, but the contract does not: one record per event, written at processing time, capturing every action and the final verified outcome, immutable once written. Nested dicts and lists are serialised to JSON strings before writing, since Table Storage only accepts flat scalar values.
+The shapes differ, but the contract does not: one record per event, written at processing time, capturing every action and the final verified outcome, and written once by the engine. These Mover and Leaver records live in Azure Table Storage (`MoverAuditLog`, `LeaverAuditLog`) — which is real, deployed storage, though Table rows are technically updatable, so "written once" here is an engine-side discipline rather than a storage-enforced guarantee (§9.6). Nested dicts and lists are serialised to JSON strings before writing, since Table Storage only accepts flat scalar values.
 
 ### 9.5 The Run Summary
 
@@ -1048,7 +1064,11 @@ The summary is deliberately *not* authoritative. It is additive: it never replac
 
 ### 9.6 Storage and Immutability
 
-The audit layer spans two storage models: blob storage for the Joiner's `DecisionReport` documents, time-partitioned under `reports/{year}/{month}/`, and Table Storage for the Mover and Leaver logs. Both are immutable by intent — `overwrite=False` on the blob path, and the production container is expected to carry an immutability policy so records cannot be deleted or replaced even by the engine's own identity. The `correlation_id` on each report ties it to Azure Function platform logs, and the run summary's `correlation_id` ties it back to the individual event reports, so the three layers — platform log, event report, run summary — cross-reference rather than duplicate.
+The audit layer spans two storage models, and it is worth being exact about what is deployed and what is not. The Mover and Leaver records are written to **Azure Table Storage** (`MoverAuditLog`, `LeaverAuditLog`) — real, deployed storage. The Joiner's `DecisionReport` documents are written as **local JSON files** today; the planned production form is a blob, time-partitioned under `reports/{year}/{month}/`, written `overwrite=False` in a container with an immutability policy.
+
+Neither model is storage-immutable yet. Table rows are technically updatable, and the Joiner reports are ordinary files. "Written once" is therefore an engine-side discipline — the code writes each record once and never rewrites it — not a guarantee the storage layer enforces. Closing that gap is a specific planned item (§11): move Joiner reports to write-once blob storage with a retention policy, and treat the audit tables as append-only under the same policy regime. Until then, the audit trail is complete and produced at processing time, but its immutability rests on the engine's behaviour rather than on the storage platform refusing to overwrite.
+
+The `correlation_id` on each report ties it to Azure Function platform logs, and the run summary's `correlation_id` ties it back to the individual event reports, so the three layers — platform log, event report, run summary — cross-reference rather than duplicate.
 
 The `Reconciliation` event type is already present in the schema (ADR-012). The reconciliation pipeline itself is not built, but the audit contract reserves a place for it, so when it lands its records fit the existing shape rather than forcing a schema change.
 
@@ -1100,7 +1120,7 @@ flowchart LR
     style REC fill:#E9F1FB,color:#16244A
 ```
 
-Each arrow is a component boundary, and each box is a data contract owned by one layer. The raw record is source-shaped. The canonical identity is engine-shaped. The entitlement result is a set of package assignments, each tagged with its rule ID. The assignment requests are Graph-shaped. The verified state is what the tenant actually returned. And the audit record is the immutable account of the whole journey. A Leaver's path is shorter — it skips the resolution and delta boxes and moves from current state straight to removal requests — but it ends in the same audit contract.
+Each arrow is a component boundary, and each box is a data contract owned by one layer. The raw record is source-shaped. The canonical identity is engine-shaped. The entitlement result is a set of package assignments, each tagged with its rule ID. The assignment requests are Graph-shaped. The verified state is what the tenant actually returned. And the audit record is the written account of the whole journey. A Leaver's path is shorter — it skips the resolution and delta boxes and moves from current state straight to removal requests — but it ends in the same audit contract.
 
 ### 10.5 Where Records Leave the Flow
 
@@ -1114,25 +1134,33 @@ By the time a record reaches entitlement resolution, it is genuinely new, genuin
 
 ---
 
-## 11. Azure Deployment Architecture (Planned)
+## 11. Azure Deployment Architecture
 
-The engine runs today on the Azure Functions local runtime, driven by a local runner and a local PowerShell host, with credentials in a gitignored settings file. Nothing below is deployed yet. This section is the target deployment, item by item — what gets built to move from a local development runtime to a running Azure service.
+The engine is deployed to Azure and runs there today, on an Azure Functions app (Flex Consumption) fronted by a GitHub Actions CI/CD pipeline. Local runs on the Azure Functions runtime remain the first test surface — every change is exercised against the tenant locally, then deployed — but production is a running Azure service, not a plan. This section separates what is deployed from what remains, because the engine is in a genuine middle state: live in Azure, with several productionization pieces still ahead.
 
-- **Function app and triggers.** Host the pipelines in an Azure Functions app: HTTP triggers for Joiner, Mover, and Leaver on-demand runs, and timer triggers for the BambooHR delta poll and (once built) reconciliation. Today these are invoked through the local runner.
+### 11.1 Deployed
 
-- **Managed Identity authentication.** Replace the local `ClientSecretCredential` with a Managed Identity credential for all Graph and Azure Storage access. The swap is deliberately isolated — the Graph client, the hold queue store, and the blob writer each construct their credential in a single function, so the change is confined to those points and nothing else in the layers moves.
+- **Function app and triggers.** The pipelines run in an Azure Functions app (Flex Consumption). HTTP triggers serve Joiner, Mover, and Leaver on-demand runs. The Joiner additionally exposes a Durable Functions endpoint (`joiner-durable`) alongside its synchronous HTTP trigger.
 
-- **Table Storage in Azure.** Provision the engine's tables — `JmlEvents`, the hold queue, `MoverEventLog`, `MoverAuditLog`, `LeaverEventLog`, `LeaverAuditLog`, `RetentionRegistry` — in the deployed storage account. The access patterns are already partitioned for it (§6, §8).
+- **CI/CD from source control.** GitHub Actions builds and deploys to the Azure Functions app on push, authenticated to Azure by **OIDC** — no stored publish credentials. This is the path every change ships through.
 
-- **Blob Storage for audit reports.** Write Joiner `DecisionReport` documents to a blob container under `reports/{year}/{month}/`, with an immutability policy configured so audit records cannot be deleted or overwritten (§9).
+- **Table Storage in Azure.** The engine's operational tables — `JmlEvents`, the hold queue, the Mover and Leaver event and audit logs, `RetentionRegistry` — live in the deployed storage account, partitioned as §6 and §8 describe.
+
+- **Durable Functions runtime for the Joiner.** The Joiner's provisioning runs as a Durable orchestration: user creation, a user-propagation timer, package submission, a check-and-timer delivery-poll loop, then record-and-finalize (§7.8). The waits that were blocking `time.sleep` calls are orchestrator timers, so a long delivery completes instead of hitting the gateway timeout.
+
+### 11.2 Remaining
+
+- **Managed Identity authentication.** Authentication is still `ClientSecretCredential` in both local and deployed environments. The planned change replaces it with a Managed Identity credential for all Graph and Azure Storage access; because the credential is constructed in one place per client, the swap is confined to those points (§7.1).
+
+- **Durable Functions for Mover and Leaver.** Only the Joiner is migrated. The Mover and Leaver still run their submit-then-poll inline and synchronously, and are the higher-polling-volume pipelines that most need the same treatment. This migration also gives the Leaver's deferred soft-delete the background timer it currently lacks (§7.8, §3.3).
+
+- **Blob Storage for audit reports (immutability).** Joiner `DecisionReport` documents are written as local JSON today. The planned form writes them to a blob container under `reports/{year}/{month}/` with `overwrite=False` and an immutability/retention policy, so audit records cannot be altered or deleted — closing the gap §9.6 describes.
+
+- **Validation engine reintegration.** The PowerShell governance validation engine is decoupled and skipped in current runs via `JML_SKIP_VALIDATION_ENGINE=true` (§5.3). Reintegration is deploying it as its own function app and turning the gate back on; the HTTP contract between the two is already stable.
 
 - **Config in Azure Storage.** Host the policy files — `canonical_lookup.json`, `role_mapping_rules.json`, and the governance rule set — in Azure Storage so policy updates need no redeployment, which is already how the engine loads them.
 
-- **Validation engine reintegration.** Deploy the PowerShell governance validation engine as its own function app and turn the gate back on — today it is decoupled and skipped locally via `JML_SKIP_VALIDATION_ENGINE=true` (§5.3). The HTTP contract between the two is already stable.
-
-- **Durable Functions runtime.** Migrate the submit-then-poll provisioning pattern to a Durable orchestration: the submit phase stays in the HTTP-triggered function, the poll phase moves to a timer or durable activity, and the `PendingPackage` list persists to Table Storage between them (§7.8). This runtime also gives the Leaver's deferred soft-delete a real background timer to complete on, which the inline model can't provide.
-
-- **CI/CD pipeline.** Build, test, and deploy from source control to Azure, with `local.settings.json` replaced by app settings and secrets in Key Vault. The unit-testable core (pure delta, retention, resolution, and audit logic) is already structured to run in a build stage without a tenant.
+- **Secrets in Key Vault.** App settings currently hold configuration and the client secret; moving secrets to Key Vault is part of the same hardening as Managed Identity.
 
 - **HR webhook ingestion.** Add a webhook endpoint so BambooHR pushes changes as they happen, complementing the delta poll rather than replacing it — the ingestion layer already normalises to the canonical payload regardless of how the record arrived.
 
@@ -1152,20 +1180,25 @@ Honest architecture states what it does and what it does not. This section is th
 - Applies **safe ordering** per lifecycle: add-before-remove on the Mover (ADR-009) so a transition never drops access, and disable-and-revoke-before-remove on the Leaver (ADR-015) so a partial offboarding still fails safe.
 - Reads **time-bounded retention records** to exclude specific packages from removal on a Mover, and **detects unmanaged packages** so access the engine didn't assign is left untouched on a Mover and removed on a Leaver.
 - **Verifies real tenant state** after every run — not just the Graph API response — and terminates active PIM sessions on offboarding (ADR-016).
-- Writes an **immutable per-event audit record** regardless of outcome, with actions recorded as they execute.
+- Writes a **per-event audit record** regardless of outcome, with actions recorded as they execute (written-once by the engine; storage-enforced immutability is planned — §9.6).
 - Survives a throttled or transient-erroring tenant through a **retry layer** that respects `Retry-After` and backs off on server errors.
 - Ingests from **BambooHR (live, with delta polling) and CSV**, deriving the action against live Entra state.
+- **Runs in Azure.** The engine is deployed on Azure Functions (Flex Consumption) and ships through a **GitHub Actions CI/CD pipeline authenticated by OIDC**.
+- **Runs the Joiner as a Durable Functions orchestration** — timer-driven delivery polling, so a long assignment completes rather than hitting the HTTP gateway timeout (§7.8). The Mover and Leaver remain synchronous.
+- **Fans out to downstream targets automatically on package delivery.** Because access is delivered through Access Packages, assignment triggers Entra's own provisioning: SCIM to **AWS IAM Identity Center** for the packaged applications, and native **Microsoft 365 groups** for **Teams and SharePoint** access. The engine assigns the package; Entra delivers the fan-out. This is the built, proven downstream path (distinct from the engine-owned SCIM connector in §13).
 
 ### 12.2 What the Engine Does Not Do
 
 - **Enforce Separation of Duties.** No pipeline runs an SoD check today. It is planned as platform-level enforcement in Entra Entitlement Management (ADR-008), not yet configured (§5.4).
-- **Run the governance validation gate in every environment.** The gate is currently decoupled and skipped in local runs; it is reintegrated on deployment to Azure (§5.3, §11).
-- **Run in Azure.** The engine runs on the local Functions runtime only. Deployment, Managed Identity, CI/CD, and the Durable Functions runtime are all planned, not built (§11).
+- **Run the governance validation gate.** The gate is currently decoupled and skipped in current runs; it is reintegrated once the PowerShell validation engine is itself deployed (§5.3, §11).
+- **Run the Mover and Leaver as Durable orchestrations.** Only the Joiner is migrated; the Mover and Leaver are still synchronous inline pipelines (§7.8, §11).
+- **Authenticate with Managed Identity.** Both environments still use Microsoft Graph client credentials; Managed Identity and Key Vault secrets are planned (§7.1, §11).
+- **Store audit records immutably.** Records are written once by the engine, but Joiner reports are local JSON and the audit tables are updatable — storage-enforced immutability (write-once blob with a retention policy) is planned (§9.6, §11).
 - **Recover a partially failed Leaver.** A partial offboarding is visible and contained but not yet recoverable without manual intervention — there is no hold-queue equivalent, and the reclaim (ADR-013) and reconciliation (ADR-012) paths that would resume it are unbuilt (§8.5).
-- **Complete a deferred soft-delete on its own.** The configurable hold has no background timer; finishing the delete needs a re-run or the reconciliation path, which is what the Durable Functions migration provides (§7.8, §11).
+- **Complete a deferred soft-delete on its own.** The configurable hold has no background timer; finishing the delete needs a re-run or the reconciliation path. The Joiner's durable runtime provides exactly this kind of timer, but the Leaver has not yet been migrated to use it (§7.8, §11).
 - **Write to the retention registry.** The engine reads `RetentionRegistry` but does not populate it — that requires an access request workflow. Entries are created manually today.
 - **Patch every attribute.** `usageLocation` (needs an ISO country code; the HR source sends city names) and `manager` (needs a separate Graph endpoint) are tracked but excluded from the write.
-- **Provision beyond Microsoft Graph.** Entra ID users and Access Packages are the only targets. There is no SCIM fan-out to downstream applications and no second directory (§13).
+- **Provision downstream through its own SCIM connector.** Downstream fan-out today is Entra-driven — package assignment triggers Entra's SCIM provisioning to AWS IAM Identity Center and its M365 group delivery to Teams/SharePoint (§12.1). What the engine does *not* do is own a SCIM connector of its own to arbitrary SaaS targets; that broader fan-out is future work (§13).
 - **Ingest HR events by push.** Only delta polling and CSV exist; webhook ingestion is planned (§11).
 - **Run PIM without P2**, and the Leaver's active-session termination additionally needs a PIM read scope not yet granted, so that step is skipped with a warning until the grant is in place (§7.9).
 
@@ -1183,6 +1216,6 @@ Section 11 covers getting the current engine deployed. This section covers capab
 
 - **Approval and request workflows.** An access request workflow that both gates provisioning behind approval and, critically, **populates the retention registry** the Mover already reads from — closing the loop so retention records are created by a governed process rather than by hand.
 
-- **SCIM fan-out to downstream applications.** Rather than building a second provisioner for every SaaS target, keep Entra as the single control plane and provision downstream via SCIM. This preserves one governed source of truth and one audit trail instead of two, and is the realistic route to non-Microsoft targets (versus a parallel provisioning path).
+- **Engine-owned SCIM to further SaaS targets.** Downstream fan-out already works for the targets wired through Entra — package assignment provisions AWS IAM Identity Center over SCIM and delivers Teams/SharePoint through M365 groups, all automatically (§12.1). The future step is extending that reach to SaaS applications not driven by an Entra-native connector, still keeping Entra as the single control plane and provisioning via SCIM so there is one governed source of truth and one audit trail rather than a parallel provisioning path. (Salesforce is the first candidate target.)
 
 - **A first-class Leaver recovery path.** Building on reclaim (ADR-013) and reconciliation (ADR-012), give a Leaver that fails partway a defined route back to completion — the hardening §8.5 identifies as the pipeline's next real gap.
