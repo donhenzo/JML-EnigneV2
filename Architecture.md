@@ -309,7 +309,7 @@ Expected = unchanged ∪ retain_set ∪ packages_to_add
 
 Two categories are excluded from the unexpected-assignment check: unmanaged packages (outside the managed catalogue by design) and recently removed packages (confirmed removed but possibly not yet propagated due to Graph eventual consistency). A configurable delay (default 10 seconds) runs before the fetch to account for propagation lag.
 
-The PowerShell governance validation engine then runs in PostProvision mode against the real Entra object — the same check the Joiner runs after provisioning. Currently decoupled via `JML_SKIP_VALIDATION_ENGINE=true` and will be reintegrated when the engine moves to Azure.
+The PowerShell governance validation engine then runs in PostProvision mode against the real Entra object — the same check the Joiner runs after provisioning. Currently decoupled via `JML_SKIP_VALIDATION_ENGINE=true` and reintegrated once the validation engine is itself deployed alongside the pipeline.
 
 A clean verification produces `MOVE_SUCCESS`. Any discrepancy — a missing expected package, an unexpected unaccounted-for package, or a governance validation failure — produces `MOVE_PARTIAL`. A verification fetch failure produces `MOVE_FAILED`.
 
@@ -604,7 +604,7 @@ The mapping resolver evaluates named policy rules from `role_mapping_rules.json`
 
 ### 4.4 Governance Validation
 
-Governance validation is a separately deployed PowerShell Azure Function, called over HTTP. It evaluates a canonical payload before provisioning (synthetic snapshot, zero Graph calls) and the real object after provisioning (against actual tenant state). The Python side wraps both calls behind a single gate that blocks on any failure and passes warnings through without blocking. The engine is currently decoupled at this boundary for independent testing — locally the call is skipped via `JML_SKIP_VALIDATION_ENGINE=true` — and is reintegrated when the pipeline moves to Azure. Section 5 covers the request modes, the response contract, and the two gates.
+Governance validation is a separately deployed PowerShell Azure Function, called over HTTP. It evaluates a canonical payload before provisioning (synthetic snapshot, zero Graph calls) and the real object after provisioning (against actual tenant state). The Python side wraps both calls behind a single gate that blocks on any failure and passes warnings through without blocking. The engine is currently decoupled at this boundary for independent testing — the call is skipped via `JML_SKIP_VALIDATION_ENGINE=true` — and is reintegrated once the PowerShell validation engine is itself deployed as its own function app (the pipeline is already in Azure; the validation engine is the piece not yet deployed). Section 5 covers the request modes, the response contract, and the two gates.
 
 ### 4.5 Separation of Duties (Planned)
 
@@ -704,7 +704,7 @@ Both calls return the same shape, and the Python side wraps them behind one gate
 
 The contract is simple: any entry in `failures` blocks provisioning and routes the record to the hold queue as `ValidationFailed`; `warnings` pass through without blocking. The gate decides pass or fail; it never decides what to provision.
 
-**Current status.** The validation gate is decoupled for independent testing. Local runs skip the call via `JML_SKIP_VALIDATION_ENGINE=true`, and the gate is reintegrated when the pipeline moves to Azure and the two functions run in the same environment. The design is complete and the contract is stable; the integration is toggled off in current local runs. This is stated plainly because the rest of this section describes a gate that is present in the architecture but not active in every run today.
+**Current status.** The validation gate is decoupled for independent testing. Runs skip the call via `JML_SKIP_VALIDATION_ENGINE=true`, and the gate is reintegrated once the PowerShell validation engine is deployed as its own function app and the two run in the same environment. The pipeline itself is already in Azure; it is the validation engine that is not yet deployed. The design is complete and the contract is stable; the integration is toggled off in current runs. This is stated plainly because the rest of this section describes a gate that is present in the architecture but not active in every run today.
 
 ### 5.4 Separation of Duties (Planned)
 
