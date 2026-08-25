@@ -1,0 +1,1 @@
+from Joiner.durable.activities import create_user as main

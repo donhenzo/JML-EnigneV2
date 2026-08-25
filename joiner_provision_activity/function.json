@@ -1,6 +1,0 @@
-{
-  "scriptFile": "__init__.py",
-  "bindings": [
-    {"name": "pre_result", "type": "activityTrigger", "direction": "in"}
-  ]
-}

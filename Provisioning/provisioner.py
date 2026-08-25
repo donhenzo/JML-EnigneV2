@@ -9,34 +9,33 @@
 #   a single, audited, retry-safe provisioning run for one identity.
 #
 # SEQUENCE:
-#   1. UPN existence check  — retry guard, skip creation if user already exists
+#   1. UPN existence check — retry guard, skip creation if user already exists
 #   2. Create Entra ID user
-#   3. Submit all access package requests (ADR-007) — fire all at once,
-#      then poll until every package reaches a terminal state. Only state
-#      transitions are logged — repeated polls at the same state produce
-#      no output. This keeps logs readable regardless of how long Entra
-#      takes to deliver.
-#   4. PIM group eligibility assignment — unchanged.
+#   3. Submit all access package requests (ADR-007), then poll until every
+#      package reaches a terminal state.
+#   4. PIM group eligibility assignment — unchanged, non-blocking.
 #
-# AZURE FUNCTIONS NOTE:
-#   The parallel-submit + poll pattern here is designed to convert
-#   cleanly to an async handoff when this moves to Azure:
-#     - Phase 1 (submit all) stays in the HTTP-triggered function
-#     - Phase 2 (poll loop) moves to a Timer Trigger or Durable Function
-#     - The pending_packages list persists to Table Storage between runs
-#   The tracking dataclass (PendingPackage) is the persistence shape.
+# PHASE STRUCTURE (for Durable Functions):
+#   The provisioning phases are separated into sleep-free functions so the
+#   CALLER owns the waiting. The synchronous provision_joiner() composes them
+#   with time.sleep; the Durable orchestrator composes the same functions with
+#   durable timers (create_timer) instead. The phase functions themselves never
+#   sleep — that seam is what lets both the sync and durable paths share one
+#   implementation instead of duplicating provisioning logic.
+#
+#   check_or_create_user          — create/find user, return entra_id (no sleep)
+#   submit_access_packages        — Phase 1: submit all requests, return pending
+#   poll_access_packages_once     — one poll pass over pending (no sleep)
+#   packages_all_terminal         — have all submitted packages reached terminal
+#   record_access_package_results — Phase 3: write report actions, set failure
 #
 # LOGGING:
-#   Only state transitions are logged during polling — not every poll
-#   attempt. This means the log output is the same whether a package
-#   takes 10 seconds or 5 minutes to deliver. Each transition includes
-#   the previous state, the new state, and the elapsed time since
-#   submission. This naturally evolves into an audit-grade event stream
-#   when approval workflows are added later.
+#   Only state transitions are logged during polling — not every poll attempt —
+#   so log output is the same whether a package takes 10 seconds or 5 minutes.
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from Audit.models import DecisionReport
 from Ingestion.schema import IdentityPayload
@@ -56,6 +55,8 @@ TERMINAL_STATES = {"delivered", "denied", "failed", "canceled"}
 PACKAGE_POLL_INTERVAL_SECONDS = 5.0
 PACKAGE_POLL_MAX_ATTEMPTS = 60
 
+USER_PROPAGATION_WAIT_SECONDS = 15
+
 
 @dataclass
 class ProvisioningResult:
@@ -70,9 +71,10 @@ class PendingPackage:
     """
     Tracks one access package assignment through submission and delivery.
 
-    This is the shape that would persist to Table Storage when the poll
-    loop moves to a Timer Trigger — every field needed to resume polling
-    without re-submitting.
+    Serializable (str/bool only) so it can cross a Durable activity boundary as
+    a dict when the poll loop becomes orchestrator-driven. The monotonic
+    submitted_at timing was removed for this reason — process-local clocks don't
+    survive a handoff between activities on different workers.
     """
     rule_id:           str
     access_package_id: str
@@ -83,7 +85,6 @@ class PendingPackage:
     submitted:         bool = False
     skipped:           bool = False
     error:             str  = ""
-    submitted_at:      float = 0.0
 
 
 def provision_joiner(
@@ -93,32 +94,43 @@ def provision_joiner(
     graph_client: JmlGraphClient,
     event_status: str = ""
 ) -> ProvisioningResult:
+    """
+    Synchronous Joiner provisioning. Composes the sleep-free phase functions
+    with time.sleep for the waits. The Durable orchestrator composes the SAME
+    phase functions with durable timers instead — this function is the sync
+    caller, not the only caller.
+    """
     result = ProvisioningResult()
 
-    entra_id = _check_or_create_user(
-        payload=payload,
-        report=report,
-        graph_client=graph_client,
-        event_status=event_status,
-        result=result
-    )
-
+    entra_id = check_or_create_user(payload, report, graph_client, event_status, result)
     if not entra_id:
         return result
-
     result.entra_id = entra_id
 
-    packages_ok = _assign_access_packages(
-        user_id=entra_id,
-        employee_id=payload.employee_id,
-        access_packages=entitlements.access_packages,
-        report=report,
-        graph_client=graph_client,
-        result=result
-    )
+    # Propagation wait — Entitlement Management resolves targetId against a
+    # separate index that lags user creation; without this the first package
+    # assignment can fail with SubjectNotFound. Only wait after a real creation,
+    # not a retry-resume where the user already exists.
+    logger.info(f"Waiting {USER_PROPAGATION_WAIT_SECONDS}s for user propagation...")
+    time.sleep(USER_PROPAGATION_WAIT_SECONDS)
 
-    if not packages_ok:
-        return result
+    if entitlements.access_packages:
+        pending = submit_access_packages(
+            entra_id, entitlements.access_packages, report, graph_client, result
+        )
+        if pending is None:
+            return result
+
+        for _ in range(PACKAGE_POLL_MAX_ATTEMPTS):
+            if packages_all_terminal(pending):
+                break
+            poll_access_packages_once(pending, graph_client)
+            if packages_all_terminal(pending):
+                break
+            time.sleep(PACKAGE_POLL_INTERVAL_SECONDS)
+
+        if not record_access_package_results(pending, report, result):
+            return result
 
     if entitlements.pim_groups:
         pim_ok = _assign_pim_eligibility(
@@ -140,21 +152,105 @@ def provision_joiner(
     return result
 
 
-def _assign_access_packages(
+def check_or_create_user(
+    payload:      IdentityPayload,
+    report:       DecisionReport,
+    graph_client: JmlGraphClient,
+    event_status: str,
+    result:       ProvisioningResult
+) -> str:
+    """
+    Find or create the Entra user. Returns entra_id, or "" on failure (setting
+    result.failure_*). Does NOT wait for propagation — the caller owns that wait
+    (sync path: time.sleep; durable path: an orchestrator timer). This is the
+    change from the old _check_or_create_user, which slept internally.
+    """
+    try:
+        existing = graph_client.get_user(payload.upn)
+
+        if event_status == "Processing":
+            report.add_action(
+                action="UserCreationSkipped",
+                detail=(
+                    f"User {payload.upn} already exists — "
+                    f"resuming from retry. object_id={existing['id']}"
+                ),
+                succeeded=True
+            )
+            logger.info(
+                f"Retry detected — user exists, skipping creation — "
+                f"employee={payload.employee_id}, entra_id={existing['id']}"
+            )
+            return existing["id"]
+
+        report.add_action(
+            action="UserCreationFailed",
+            detail=(
+                f"UPN {payload.upn} already exists in Entra ID "
+                "and this is not a retry. Possible duplicate identity."
+            ),
+            succeeded=False
+        )
+        result.failure_step   = "UserCreation"
+        result.failure_detail = f"UPN conflict: {payload.upn} already exists"
+        logger.error(
+            f"UPN conflict — employee={payload.employee_id}, upn={payload.upn}"
+        )
+        return ""
+
+    except UserNotFoundError:
+        pass
+
+    except GraphClientError as e:
+        report.add_action(
+            action="UserCreationFailed",
+            detail=f"Graph API error checking UPN existence: {e}",
+            succeeded=False
+        )
+        result.failure_step   = "UPNCheck"
+        result.failure_detail = str(e)
+        return ""
+
+    try:
+        created = graph_client.create_user(payload)
+        report.add_action(
+            action="UserCreated",
+            detail=f"upn={created['upn']}, object_id={created['id']}",
+            succeeded=True
+        )
+        logger.info(
+            f"User created — employee={payload.employee_id}, "
+            f"upn={payload.upn}, entra_id={created['id']}"
+        )
+        return created["id"]
+
+    except GraphClientError as e:
+        report.add_action(
+            action="UserCreationFailed",
+            detail=str(e),
+            succeeded=False
+        )
+        result.failure_step   = "UserCreation"
+        result.failure_detail = str(e)
+        logger.error(
+            f"User creation failed — employee={payload.employee_id}: {e}"
+        )
+        return ""
+
+
+def submit_access_packages(
     user_id:         str,
-    employee_id:     str,
     access_packages,
     report:          DecisionReport,
     graph_client:    JmlGraphClient,
-    result:          ProvisioningResult
-) -> bool:
-    if not access_packages:
-        logger.info(f"No access package assignments for employee={employee_id}")
-        return True
-
-    # Phase 1 — Submit all requests
+    result:          ProvisioningResult,
+) -> list[PendingPackage] | None:
+    """
+    Phase 1: check-existing and submit each access package request. Returns the
+    pending list (carrying request_ids for the poll phase), or None on a
+    submission failure (setting result.failure_*). No poll, no sleep.
+    """
     pending: list[PendingPackage] = []
-    submission_start = time.monotonic()
 
     for ap in access_packages:
         pkg = PendingPackage(
@@ -164,9 +260,7 @@ def _assign_access_packages(
         )
 
         try:
-            existing = graph_client.check_package_assignment(
-                user_id, ap.access_package_id
-            )
+            existing = graph_client.check_package_assignment(user_id, ap.access_package_id)
 
             if existing:
                 pkg.skipped = True
@@ -179,7 +273,7 @@ def _assign_access_packages(
                     ),
                     succeeded=True,
                 )
-                logger.info(f"  ✓ {ap.rule_id} — already assigned, skipped")
+                logger.info(f"  {ap.rule_id} — already assigned, skipped")
                 pending.append(pkg)
                 continue
 
@@ -192,11 +286,7 @@ def _assign_access_packages(
             pkg.request_id = request.get("id", "")
             pkg.submitted = True
             pkg.state = "submitted"
-            pkg.submitted_at = time.monotonic()
-
-            logger.info(
-                f"  ✓ {ap.rule_id} — request submitted (request_id={pkg.request_id})"
-            )
+            logger.info(f"  {ap.rule_id} — request submitted (request_id={pkg.request_id})")
 
         except GraphClientError as e:
             pkg.error = str(e)
@@ -206,80 +296,77 @@ def _assign_access_packages(
                 detail=f"package={ap.access_package_id} (rule={ap.rule_id}): {e}",
                 succeeded=False,
             )
-            logger.error(f"  ✗ {ap.rule_id} — submission failed: {e}")
+            logger.error(f"  {ap.rule_id} — submission failed: {e}")
 
         pending.append(pkg)
 
     submission_failures = [p for p in pending if p.state == "submission_failed"]
     if submission_failures:
         result.failure_step = "AccessPackageSubmission"
-        result.failure_detail = (
-            f"{len(submission_failures)} package(s) failed to submit"
-        )
-        return False
+        result.failure_detail = f"{len(submission_failures)} package(s) failed to submit"
+        return None
 
-    # Phase 2 — Poll for state transitions
-    packages_to_poll = [p for p in pending if p.submitted]
+    return pending
 
-    if not packages_to_poll:
-        return True
 
-    logger.info(
-        f"  Waiting for Entitlement Management provisioning..."
-    )
+def poll_access_packages_once(
+    pending:      list[PendingPackage],
+    graph_client: JmlGraphClient,
+) -> list[PendingPackage]:
+    """
+    One poll pass: fetch the current status of each still-pending package and
+    update its state in place. Returns the same list. No sleep — the caller
+    loops and owns the wait between passes (sync: time.sleep; durable: timer).
+    Only state transitions are logged, so repeated same-state polls are silent.
+    """
+    still_pending = [
+        p for p in pending if p.submitted and p.state not in TERMINAL_STATES
+    ]
 
-    for _ in range(PACKAGE_POLL_MAX_ATTEMPTS):
-        still_pending = [p for p in packages_to_poll if p.state not in TERMINAL_STATES]
+    for pkg in still_pending:
+        try:
+            status = graph_client.get_assignment_request_status(pkg.request_id)
+            new_state = status.get("state", "").lower()
+            if new_state != pkg.state:
+                logger.info(f"  {pkg.rule_id}: {pkg.state} → {new_state}")
+                pkg.previous_state = pkg.state
+                pkg.state = new_state
+        except GraphClientError as e:
+            logger.warning(f"  Poll error for {pkg.rule_id}: {e}")
 
-        if not still_pending:
-            break
+    return pending
 
-        for pkg in still_pending:
-            try:
-                status = graph_client.get_assignment_request_status(pkg.request_id)
-                new_state = status.get("state", "").lower()
 
-                if new_state != pkg.state:
-                    elapsed = time.monotonic() - pkg.submitted_at
-                    logger.info(
-                        f"  {pkg.rule_id}: {pkg.state} → {new_state} "
-                        f"({elapsed:.0f}s)"
-                    )
-                    pkg.previous_state = pkg.state
-                    pkg.state = new_state
+def packages_all_terminal(pending: list[PendingPackage]) -> bool:
+    """True if every submitted (non-skipped) package has reached a terminal state."""
+    return not [
+        p for p in pending if p.submitted and p.state not in TERMINAL_STATES
+    ]
 
-            except GraphClientError as e:
-                logger.warning(
-                    f"  Poll error for {pkg.rule_id}: {e}"
-                )
 
-        still_pending = [p for p in packages_to_poll if p.state not in TERMINAL_STATES]
-        if not still_pending:
-            break
-
-        time.sleep(PACKAGE_POLL_INTERVAL_SECONDS)
-
-    # Phase 3 — Record results and log summary
-    total_submitted = len(packages_to_poll)
+def record_access_package_results(
+    pending: list[PendingPackage],
+    report:  DecisionReport,
+    result:  ProvisioningResult,
+) -> bool:
+    """
+    Phase 3: read final package states, write the report action per package, and
+    set result.failure_* if any package did not deliver. Returns all_ok. No sleep.
+    """
+    total_submitted = len([p for p in pending if p.submitted])
     total_delivered = 0
     total_failed = 0
     all_ok = True
-    total_elapsed = time.monotonic() - submission_start
 
     for pkg in pending:
         if pkg.skipped:
             continue
 
-        elapsed = time.monotonic() - pkg.submitted_at if pkg.submitted_at else 0
-
         if pkg.state == "delivered":
             total_delivered += 1
             report.add_action(
                 action="AccessPackageAssigned",
-                detail=(
-                    f"package={pkg.access_package_id} (rule={pkg.rule_id}), "
-                    f"duration={elapsed:.0f}s"
-                ),
+                detail=f"package={pkg.access_package_id} (rule={pkg.rule_id})",
                 succeeded=True,
             )
 
@@ -300,10 +387,7 @@ def _assign_access_packages(
             total_failed += 1
             report.add_action(
                 action="AccessPackageAssignmentFailed",
-                detail=(
-                    f"package={pkg.access_package_id} (rule={pkg.rule_id}) "
-                    f"— state={pkg.state}"
-                ),
+                detail=f"package={pkg.access_package_id} (rule={pkg.rule_id}) — state={pkg.state}",
                 succeeded=False,
             )
             all_ok = False
@@ -321,124 +405,21 @@ def _assign_access_packages(
             )
             all_ok = False
 
-    # Summary line — one line regardless of package count
     if all_ok:
         logger.info(
-            f"  Provisioning complete — "
-            f"packages submitted: {total_submitted}, "
-            f"packages delivered: {total_delivered}, "
-            f"duration: {total_elapsed:.0f}s"
+            f"  Provisioning complete — submitted: {total_submitted}, "
+            f"delivered: {total_delivered}"
         )
     else:
         logger.error(
-            f"  Provisioning incomplete — "
-            f"packages submitted: {total_submitted}, "
-            f"packages delivered: {total_delivered}, "
-            f"packages failed: {total_failed}, "
-            f"duration: {total_elapsed:.0f}s"
+            f"  Provisioning incomplete — submitted: {total_submitted}, "
+            f"delivered: {total_delivered}, failed: {total_failed}"
         )
-
-    if not all_ok:
-        failed_pkgs = [
-            p for p in pending
-            if not p.skipped and p.state != "delivered"
-        ]
+        failed_pkgs = [p for p in pending if not p.skipped and p.state != "delivered"]
         result.failure_step = "AccessPackageAssignment"
-        result.failure_detail = ", ".join(
-            f"{p.rule_id}={p.state}" for p in failed_pkgs
-        )
+        result.failure_detail = ", ".join(f"{p.rule_id}={p.state}" for p in failed_pkgs)
 
     return all_ok
-
-
-def _check_or_create_user(
-    payload:      IdentityPayload,
-    report:       DecisionReport,
-    graph_client: JmlGraphClient,
-    event_status: str,
-    result:       ProvisioningResult
-) -> str:
-    try:
-        existing = graph_client.get_user(payload.upn)
-
-        if event_status == "Processing":
-            report.add_action(
-                action="UserCreationSkipped",
-                detail=(
-                    f"User {payload.upn} already exists — "
-                    f"resuming from retry. object_id={existing['id']}"
-                ),
-                succeeded=True
-            )
-            logger.info(
-                f"Retry detected — user exists, skipping creation — "
-                f"employee={payload.employee_id}, entra_id={existing['id']}"
-            )
-            return existing["id"]
-
-        else:
-            report.add_action(
-                action="UserCreationFailed",
-                detail=(
-                    f"UPN {payload.upn} already exists in Entra ID "
-                    "and this is not a retry. Possible duplicate identity."
-                ),
-                succeeded=False
-            )
-            result.failure_step   = "UserCreation"
-            result.failure_detail = f"UPN conflict: {payload.upn} already exists"
-            logger.error(
-                f"UPN conflict — employee={payload.employee_id}, upn={payload.upn}"
-            )
-            return ""
-
-    except UserNotFoundError:
-        pass
-
-    except GraphClientError as e:
-        report.add_action(
-            action="UserCreationFailed",
-            detail=f"Graph API error checking UPN existence: {e}",
-            succeeded=False
-        )
-        result.failure_step   = "UPNCheck"
-        result.failure_detail = str(e)
-        return ""
-
-    try:
-        created = graph_client.create_user(payload)
-
-        report.add_action(
-            action="UserCreated",
-            detail=f"upn={created['upn']}, object_id={created['id']}",
-            succeeded=True
-        )
-        logger.info(
-            f"User created — employee={payload.employee_id}, "
-            f"upn={payload.upn}, entra_id={created['id']}"
-        )
-
-        # Wait for newly created user to propagate across Entra services.
-        # Entitlement Management resolves targetId against a separate index
-        # that lags behind user creation — without this, the first package
-        # assignment can fail with SubjectNotFound.
-        logger.info("Waiting 15s for user propagation across Entra services...")
-        time.sleep(15)
-
-        return created["id"]
-
-    except GraphClientError as e:
-        report.add_action(
-            action="UserCreationFailed",
-            detail=str(e),
-            succeeded=False
-        )
-        result.failure_step   = "UserCreation"
-        result.failure_detail = str(e)
-        logger.error(
-            f"User creation failed — employee={payload.employee_id}: {e}"
-        )
-        return ""
 
 
 def _assign_pim_eligibility(
@@ -449,7 +430,7 @@ def _assign_pim_eligibility(
     graph_client: JmlGraphClient,
     result:       ProvisioningResult,
 ) -> bool:
-    """PIM failure is non-blocking — returns True always."""
+    """PIM failure is non-blocking — returns True always. UNCHANGED from before."""
     for pim_group in pim_groups:
         pim_result = assign_pim_group_eligibility(
             graph_client=  graph_client,

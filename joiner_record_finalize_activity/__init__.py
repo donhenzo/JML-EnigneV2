@@ -1,0 +1,1 @@
+from Joiner.durable.activities import record_and_finalize as main

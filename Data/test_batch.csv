@@ -1,0 +1,3 @@
+EmployeeId,UPN,DisplayName,Department,JobTitle,ManagerId,StartDate,EmploymentType,Location,Action,RetainRoles,RetainList
+BATCH_TEST_A,batchtesta@eziheobed7gmail.onmicrosoft.com,Batch Test A,Information Technology,IT Support Analyst,,2026-08-21,Employee,,Joiner,false,
+BATCH_TEST_B,batchtestb@eziheobed7gmail.onmicrosoft.com,Batch Test B,zzz-nonexistent-dept,zzz-nonexistent-title,,2026-08-21,Employee,,Joiner,false,
