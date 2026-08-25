@@ -48,35 +48,33 @@ class IdentityPayload:
     audit layers. Never log the full object in production without scrubbing
     sensitive fields (e.g. manager relationships, employment type).
     """
-
-    #  Core identity properties 
+    #  Core identity properties — required and normalized. These are the fields that uniquely identify. 
+    
     employee_id: str                           # Unique HR source identifier
     upn: str                                   # User principal name — constructed or provided
     display_name: str                          # Normalized full name
     department: Optional[str]                  # Normalized via canonical lookup; None = unresolved
     job_title: Optional[str]                   # Normalized via canonical lookup; None = unresolved
-    manager_id: Optional[str]                  # EmployeeId of the manager
     start_date: date                           # ISO 8601 — enforced as a date object, not a string
     employment_type: EmploymentType            # Employee / Contractor / Guest
-    location: Optional[str]                    # Office or region
 
-    # Lifecycle control 
+    # Lifecycle control
     action: JmlAction                          # Joiner / Mover / Leaver
 
-    # Mover-specific retention behavior
-    #  # When True, existing access should be preserved during a mover event.
-    # This prevents automatic role removal during department transitions. 
-    retain_roles: bool = False                 # True = retain all existing access across transition
-    retain_list: list[str] = field(default_factory=list)  # Selective list of role/group IDs to retain
+    # Optional source attributes — absent-tolerant. manager_id and location
+    # may not arrive from every HR source or every lifecycle event; both are
+    # already treated as non-fatal downstream (manager is resolved best-effort
+    # and excluded from the attribute PATCH; location feeds usageLocation,
+    # which is also excluded from the PATCH). Defaulted so a payload without
+    # them constructs cleanly rather than failing at the schema boundary.
+    manager_id: Optional[str] = None           # EmployeeId of the manager
+    location: Optional[str] = None             # Office or region
 
-    # provides which HR source this identity came from. Source-qualifies
-    # the synthetic identity ID (ADR-017) so records from different HR systems
-    # (BambooHR, later OrangeHRM) can't collide on the same employee_id.
-    # Defaults to the only source in use today; a second source's mapper sets
-    # this explicitly.
+    # Mover-specific retention behavior
+    retain_roles: bool = False
+    retain_list: list[str] = field(default_factory=list)
     source: str = "BAMBOOHR"
 
-    #  Normalization state set by the normalization layer, not parsed from CSV 
     normalization_passed: bool = False
     normalization_failures: list[str] = field(default_factory=list)
    
