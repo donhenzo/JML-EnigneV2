@@ -607,59 +607,39 @@ def _execute_package_removals(
 
 
 # Attribute update
-
 def _execute_attribute_update(
     graph_client: JmlGraphClient,
     user_id:      str,
     patch_dict:   dict,
 ) -> tuple[bool, str]:
     """
-    PATCH the user's Entra ID attributes with changed values.
+    PATCH the user's changed Entra ID attributes.
 
-    manager and usageLocation are excluded from the PATCH body.
-    manager requires a separate Graph endpoint.
-    usageLocation requires an ISO 3166-1 alpha-2 country code — the CSV
-    carries city names. Excluded until location-to-country mapping is
-    added to canonical_lookup.json.
+    manager and usageLocation are excluded from the PATCH body. manager
+    requires a separate Graph endpoint; usageLocation requires an ISO
+    3166-1 alpha-2 country code, and the source carries city names —
+    excluded until a location-to-country mapping is added to
+    canonical_lookup.json.
 
     Returns (succeeded, error_message).
     """
-    if not patch_dict:
+    body = {
+        field: value
+        for field, value in patch_dict.items()
+        if field not in ("manager", "usageLocation")
+    }
+
+    if not body:
         return True, ""
 
     try:
-        from msgraph.generated.models.user import User as MsUser
-
-        user_patch = MsUser()
-
-        field_map = {
-            "department":     "department",
-            "jobTitle":       "job_title",
-            "officeLocation": "office_location",
-            "usageLocation":  "usage_location",
-            "employeeType":   "employee_type",
-        }
-
-        for field_name, value in patch_dict.items():
-            if field_name == "manager":
-                continue
-            if field_name == "usageLocation":
-                continue
-            sdk_attr = field_map.get(field_name)
-            if sdk_attr:
-                setattr(user_patch, sdk_attr, value)
-
-        graph_client._run(
-            graph_client._client.users.by_user_id(user_id).patch(user_patch)
-        )
-
+        graph_client.patch_user(user_id, body)
         logger.info(
             "Attribute update applied — user=%s, fields=%s",
-            user_id, list(patch_dict.keys()),
+            user_id, list(body.keys()),
         )
         return True, ""
-
-    except Exception as e:
+    except GraphClientError as e:
         logger.error(
             "Attribute update failed — user=%s, error=%s",
             user_id, str(e),
