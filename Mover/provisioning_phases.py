@@ -43,9 +43,12 @@ from Provisioning.graph_client import JmlGraphClient, GraphClientError
 
 logger = logging.getLogger(__name__)
 
-# assignmentRequests terminal requestState values — capitalized, read raw
-# (never lowercased). The Mover keys off `== "Delivered"` exactly.
-TERMINAL_REQUEST_STATES = frozenset({"Delivered", "Denied", "Failed", "Canceled"})
+# assignmentRequests terminal `state` values (v1.0 API, lowercase). The field
+# is `state`, NOT `requestState` — confirmed against a raw Graph response
+# 27 Aug (req 449d297c: {"state": "delivered", ...}, no requestState field).
+# A delivered add or a delivered remove both terminate here; the non-delivered
+# terminals are denied/canceled/failed. "delivered" is the success value for both.
+TERMINAL_REQUEST_STATES = frozenset({"delivered", "denied", "canceled", "failed"})
 
 
 @dataclass
@@ -67,7 +70,7 @@ class PendingPackage:
     request_type:      str          # "adminAdd" | "adminRemove"
     label:             str  = ""     # human label for logs only, never logic
     request_id:        str  = ""
-    state:             str  = ""     # raw requestState from assignmentRequests
+    state:             str  = ""     # raw state from assignmentRequests
     previous_state:    str  = ""
     submitted:         bool = False
     skipped:           bool = False  # additions only — already delivered
@@ -124,14 +127,13 @@ def poll_packages_once(
     for pkg in still_pending:
         try:
             status = graph_client.get_assignment_request_status(pkg.request_id)
-            new_state = status.get("requestState", "")
+            new_state = status.get("state", "")
             if new_state and new_state != pkg.state:
                 logger.info("  %s: %s → %s", pkg.label, pkg.state, new_state)
                 pkg.previous_state = pkg.state
                 pkg.state = new_state
         except GraphClientError as e:
             logger.warning("  Poll error for %s: %s", pkg.label, e)
-
     return pending
 
 
@@ -186,7 +188,7 @@ def submit_additions(
             )
             if existing and existing.get("state") == "delivered":
                 pkg.skipped = True
-                pkg.state = "Delivered"
+                pkg.state = "delivered"
                 logger.info("  ✓ %s — already delivered, skipped", label)
                 pending.append(pkg)
                 continue
@@ -269,7 +271,7 @@ def finalize_additions(
             })
             continue
 
-        if pkg.state == "Delivered":
+        if pkg.state == "delivered":
             delivered.add(pkg.access_package_id)
             delivered_count += 1
             actions_taken.append({
@@ -280,7 +282,7 @@ def finalize_additions(
             })
             logger.info("  ✓ %s — added", label)
 
-        elif pkg.state in ("Denied", "Failed", "Canceled"):
+        elif pkg.state in ("denied", "failed", "canceled"): 
             all_succeeded = False
             failed_count += 1
             actions_taken.append({
@@ -422,7 +424,7 @@ def finalize_removals(
             logger.warning("  ✗ %s — removal failed: %s", label, pkg.error)
             continue
 
-        if pkg.state == "Delivered":
+        if pkg.state == "delivered":
             removed_count += 1
             actions_taken.append({
                 "action":     "PackageRemoval",
