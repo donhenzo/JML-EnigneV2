@@ -1,0 +1,1 @@
+from Mover.durable.activities import verify_finalize as main

@@ -1,0 +1,1 @@
+from Mover.durable.starter import start as main
