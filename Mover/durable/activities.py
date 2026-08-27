@@ -130,10 +130,10 @@ def _new_audit_record(employee_id, event_id):
 # Activity: pre — claim -> concurrent -> fetch+lock -> resolve -> delta -> retention.
 # All the zero-wait stages. Short-circuits on duplicate/concurrent/fetch-failure.
 
-def pre(payload_dict: dict) -> dict:
+def pre(state: dict) -> dict:
     from Functions.Event_store.event_store import generate_event_id
 
-    payload = _payload_from_dict(payload_dict)
+    payload = _payload_from_dict(state)
     employee_id = payload.employee_id
     event_id = generate_event_id(employee_id, "Mover", payload.start_date.isoformat())
 
@@ -210,7 +210,7 @@ def pre(payload_dict: dict) -> dict:
         "final_status":       "PROCEED",
         "employee_id":        employee_id,
         "event_id":           event_id,
-        "payload_dict":       payload_dict,
+        "payload_dict":       state,
         "user_id":            fetch.data["user_id"],
         "package_labels":     resolve.data["package_labels"],
         "new_policy_map":     resolve.data["new_policy_map"],
