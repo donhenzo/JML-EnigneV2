@@ -77,7 +77,7 @@ flowchart TD
     LE["Leaver Event"] --> CE["Claim Event"]
     CE --> DIS["Disable Account"]
     DIS --> REV["Revoke Sessions"]
-    REV --> REM["Remove All Access Packages"]
+    REV --> REM["Remove All Access Packages<br/>durable timer poll loop"]
     REM --> PIM["Terminate Active PIM Sessions"]
     PIM --> SD["Soft Delete"]
     SD --> VO["Verify Offboarding"]
@@ -87,6 +87,8 @@ flowchart TD
 The Leaver does not attempt to calculate what the user *should* have. It removes what the user currently holds.
 
 This makes the workflow fail-safe: if a downstream cleanup operation fails, the account has already been prevented from authenticating.
+
+The Leaver runs as an Azure Durable Functions orchestration. Because offboarding is all-removal, every package removal is polled through durable timers rather than a blocking wait — so an offboarding whose removals take several minutes completes cleanly instead of being cut off at the gateway timeout. The disable and session revocation run first, inside the pre-removal stage, so the fail-safe holds regardless of how the rest of the run proceeds. There is one removal poll loop and no add-before-remove gate, which makes the Leaver orchestration simpler than the Mover's.
 
 ---
 
@@ -158,13 +160,13 @@ The execution layer is deliberately separated from the governance decision.
 
 ### Execution Model — Durable Migration Status
 
-Long-running entitlement delivery is being migrated to Azure Durable Functions, so that polling waits are orchestrator-driven timers rather than blocking calls bound by the HTTP gateway timeout. The migration is per-pipeline:
+Long-running entitlement delivery runs on Azure Durable Functions, so that polling waits are orchestrator-driven timers rather than blocking calls bound by the HTTP gateway timeout. All three pipelines are migrated:
 
 | Pipeline   | Execution Model                          | Status      |
 | ---------- | ---------------------------------------- | ----------- |
 | **Joiner** | Durable Functions — timer-driven polling | ✅ Complete  |
 | **Mover**  | Durable Functions — timer-driven polling | ✅ Complete  |
-| **Leaver** | Synchronous                              | 🚧 Planned  |
+| **Leaver** | Durable Functions — timer-driven polling | ✅ Complete  |
 
 Each pipeline also retains a synchronous execution path, used by the CSV/local runner alongside its HTTP entry point.
 
@@ -203,7 +205,7 @@ The important part is that this is not only a policy simulation. The workflows e
 * Deterministic and idempotent event processing
 * SHA-256 event identity and atomic event claiming
 * Per-event audit records (written once by the engine; storage-enforced immutability planned)
-* Durable Functions orchestration for the Joiner and Mover (timer-driven entitlement polling)
+* Durable Functions orchestration for the Joiner, Mover, and Leaver (timer-driven entitlement polling)
 * BambooHR ingestion
 * CSV offline execution
 * Direct HTTP lifecycle event ingestion
@@ -221,7 +223,7 @@ The important part is that this is not only a policy simulation. The workflows e
 | ----------------------- | -------------------------------------------------- |
 | Runtime                 | Python 3.11                                        |
 | Compute                 | Azure Functions — Flex Consumption                 |
-| Orchestration           | Azure Durable Functions (Joiner, Mover)            |
+| Orchestration           | Azure Durable Functions (Joiner, Mover, Leaver)    |
 | Identity                | Microsoft Entra ID                                 |
 | API                     | Microsoft Graph                                    |
 | Governance              | Entra Identity Governance / Entitlement Management |
@@ -254,7 +256,7 @@ The important part is that this is not only a policy simulation. The workflows e
 * Conflict handling and Leaver supersede
 * Tenant-state verification
 * Per-event audit reporting
-* Durable Functions execution for the Joiner and Mover (timer-driven entitlement polling)
+* Durable Functions execution for the Joiner, Mover, and Leaver (timer-driven entitlement polling)
 * Synthetic identity ID for pre-provision governance (payload side)
 * BambooHR ingestion
 * CSV execution
@@ -265,7 +267,6 @@ The important part is that this is not only a policy simulation. The workflows e
 
 ### In Progress / Planned
 
-* Durable Functions migration for the Leaver (Joiner and Mover complete)
 * Synthetic identity consumption in the validation engine (re-coupling)
 * Last-state store for webhook-driven lifecycle processing
 * BambooHR webhook ingestion
@@ -311,7 +312,7 @@ The same pattern is available for:
 /api/leaver
 ```
 
-The Joiner and Mover each additionally expose a Durable Functions endpoint — `/api/joiner-durable` and `/api/mover-durable` — which returns `202 Accepted` with a status URL and runs the pipeline as an orchestration. The synchronous `/api/joiner` and `/api/mover` endpoints remain available.
+Each pipeline additionally exposes a Durable Functions endpoint — `/api/joiner-durable`, `/api/mover-durable`, and `/api/leaver-durable` — which returns `202 Accepted` with a status URL and runs the pipeline as an orchestration. The synchronous `/api/joiner`, `/api/mover`, and `/api/leaver` endpoints remain available.
 
 This provides the interface required for eventual HR webhook integration.
 
