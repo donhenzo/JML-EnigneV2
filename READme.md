@@ -52,11 +52,18 @@ The critical property is **add-before-remove**.
 
 If the new access cannot be delivered, the old access is not removed.
 
+The Mover runs as an Azure Durable Functions orchestration. Like the Joiner, the HTTP call returns immediately and both the addition and removal deliveries are polled through durable timers rather than blocking waits — so a role change whose packages take several minutes to deliver completes cleanly instead of being cut off at the gateway timeout. The add-before-remove gate lives in the orchestrator: removals and the attribute update run only after every addition is confirmed delivered.
+
 ```mermaid
 flowchart LR
     CUR["Current Access"] --> DELTA["Delta"]
     TGT["Target Access"] --> DELTA
-    DELTA --> ADD["Add"] --> VER["Verify"] --> REM["Remove"]
+    DELTA --> ADD["Add"]
+    ADD --> POLL1["Poll for Delivery<br/>durable timer loop"]
+    POLL1 --> GATE{"All added<br/>delivered?"}
+    GATE -->|Yes| REM["Remove"] --> POLL2["Poll for Removal<br/>durable timer loop"]
+    POLL2 --> ATTR["Update Attributes"] --> VER["Verify"]
+    GATE -->|No| DEFER["Defer removals<br/>+ attribute update"] --> VER
 ```
 
 ### Leaver
@@ -156,7 +163,7 @@ Long-running entitlement delivery is being migrated to Azure Durable Functions, 
 | Pipeline   | Execution Model                          | Status      |
 | ---------- | ---------------------------------------- | ----------- |
 | **Joiner** | Durable Functions — timer-driven polling | ✅ Complete  |
-| **Mover**  | Synchronous                              | 🚧 Planned  |
+| **Mover**  | Durable Functions — timer-driven polling | ✅ Complete  |
 | **Leaver** | Synchronous                              | 🚧 Planned  |
 
 Each pipeline also retains a synchronous execution path, used by the CSV/local runner alongside its HTTP entry point.
@@ -196,7 +203,7 @@ The important part is that this is not only a policy simulation. The workflows e
 * Deterministic and idempotent event processing
 * SHA-256 event identity and atomic event claiming
 * Per-event audit records (written once by the engine; storage-enforced immutability planned)
-* Durable Functions orchestration for the Joiner (timer-driven entitlement polling)
+* Durable Functions orchestration for the Joiner and Mover (timer-driven entitlement polling)
 * BambooHR ingestion
 * CSV offline execution
 * Direct HTTP lifecycle event ingestion
@@ -214,7 +221,7 @@ The important part is that this is not only a policy simulation. The workflows e
 | ----------------------- | -------------------------------------------------- |
 | Runtime                 | Python 3.11                                        |
 | Compute                 | Azure Functions — Flex Consumption                 |
-| Orchestration           | Azure Durable Functions (Joiner)                   |
+| Orchestration           | Azure Durable Functions (Joiner, Mover)            |
 | Identity                | Microsoft Entra ID                                 |
 | API                     | Microsoft Graph                                    |
 | Governance              | Entra Identity Governance / Entitlement Management |
@@ -247,7 +254,7 @@ The important part is that this is not only a policy simulation. The workflows e
 * Conflict handling and Leaver supersede
 * Tenant-state verification
 * Per-event audit reporting
-* Durable Functions execution for the Joiner (timer-driven entitlement polling)
+* Durable Functions execution for the Joiner and Mover (timer-driven entitlement polling)
 * Synthetic identity ID for pre-provision governance (payload side)
 * BambooHR ingestion
 * CSV execution
@@ -258,7 +265,7 @@ The important part is that this is not only a policy simulation. The workflows e
 
 ### In Progress / Planned
 
-* Durable Functions migration for Mover and Leaver (Joiner complete)
+* Durable Functions migration for the Leaver (Joiner and Mover complete)
 * Synthetic identity consumption in the validation engine (re-coupling)
 * Last-state store for webhook-driven lifecycle processing
 * BambooHR webhook ingestion
@@ -272,43 +279,11 @@ The important part is that this is not only a policy simulation. The workflows e
 
 ---
 
-## Running Locally
-
-```bash
-pip install -r requirements.txt
-
-# Joiner
-python scripts/run_local.py \
-  --csv Data/sample_joiners.csv \
-  --clean
-
-# Mover
-python scripts/run_local.py \
-  --source mover \
-  --csv Data/sample_movers.csv \
-  --clean
-
-# Leaver
-python scripts/run_local.py \
-  --source leaver \
-  --csv Data/sample_leavers.csv \
-  --clean
-
-# BambooHR — derive lifecycle action automatically
-python scripts/run_local.py \
-  --source api \
-  --id Acc003
-
-python scripts/run_local.py \
-  --source api \
-  --mode delta
-```
-
----
-
 ## Calling the API
 
 All three lifecycle pipelines accept JSON over HTTP.
+
+The deployed Function App reads its credentials and connection strings (Graph client credentials, storage connection strings) from its application settings, configured locally in `local.settings.json`.
 
 ```bash
 curl -X POST \
@@ -336,7 +311,7 @@ The same pattern is available for:
 /api/leaver
 ```
 
-The Joiner additionally exposes a Durable Functions endpoint, `/api/joiner-durable`, which returns `202 Accepted` with a status URL and runs the pipeline as an orchestration. The synchronous `/api/joiner` endpoint remains available.
+The Joiner and Mover each additionally expose a Durable Functions endpoint — `/api/joiner-durable` and `/api/mover-durable` — which returns `202 Accepted` with a status URL and runs the pipeline as an orchestration. The synchronous `/api/joiner` and `/api/mover` endpoints remain available.
 
 This provides the interface required for eventual HR webhook integration.
 

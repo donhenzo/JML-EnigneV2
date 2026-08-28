@@ -39,7 +39,7 @@ Joiner and Mover share almost the entire pipeline and diverge only in the middle
 
 The stack is Microsoft-native throughout. Python 3.11 on Azure Functions orchestrates the flow, Microsoft Graph is the only execution interface, Azure Table Storage holds event and audit state, and a separately deployed PowerShell function runs governance validation over HTTP. HR events come from BambooHR live or from CSV for offline testing.
 
-All three lifecycle branches are implemented and have run end to end against a live Entra ID tenant. The engine is deployed to Azure Functions (Flex Consumption) through a GitHub Actions CI/CD pipeline authenticated by OIDC; every change is tested against the tenant on the local Functions runtime first, then deployed. The Joiner's provisioning runs as an Azure Durable Functions orchestration in that deployment — its delivery poll is an orchestrator-driven timer loop rather than a blocking wait — while the Mover and Leaver are still synchronous and await the same migration. Several productionization pieces remain deliberately unbuilt: authentication is still Microsoft Graph client credentials in both environments (Managed Identity is not yet adopted), the governance validation engine is decoupled at the HTTP boundary and skipped in current runs until it is itself deployed, and Joiner audit reports are written as local JSON rather than to immutable blob storage. This is an honest middle state — live in Azure, but with productionization still in progress — and Section 11 (Azure Deployment), Section 12 (Architectural Boundaries), and Section 13 (Future Evolution) state exactly where each line falls.
+All three lifecycle branches are implemented and have run end to end against a live Entra ID tenant. The engine is deployed to Azure Functions (Flex Consumption) through a GitHub Actions CI/CD pipeline authenticated by OIDC; every change is tested against the tenant on the local Functions runtime first, then deployed. The Joiner's and Mover's provisioning both run as Azure Durable Functions orchestrations in that deployment — their delivery polls are orchestrator-driven timer loops rather than blocking waits — while the Leaver is still synchronous and awaits the same migration. Several productionization pieces remain deliberately unbuilt: authentication is still Microsoft Graph client credentials in both environments (Managed Identity is not yet adopted), the governance validation engine is decoupled at the HTTP boundary and skipped in current runs until it is itself deployed, and Joiner audit reports are written as local JSON rather than to immutable blob storage. This is an honest middle state — live in Azure, but with productionization still in progress — and Section 11 (Azure Deployment), Section 12 (Architectural Boundaries), and Section 13 (Future Evolution) state exactly where each line falls.
 
 ---
 
@@ -59,7 +59,7 @@ The Leaver inverts the *sequencing* of this idea rather than dropping it. It has
 
 Entitlements resolve to Access Package IDs, not group object IDs (ADR-007). The delta engine operates on packages. The retention registry keys on packages. Post-provision verification queries the `assignments` resource filtered to delivered state, not `memberOf`.
 
-This choice buys three things. Assignment is governed by Entra's own Entitlement Management policies, and access-package incompatibility relationships give Separation of Duties a natural platform-level home — the engine is designed to delegate SoD there rather than reimplement it, though that enforcement is planned, not yet configured (ADR-008, §5.4). Delivery is asynchronous and observable — a submitted request has a `requestState` the engine can poll to a terminal outcome rather than assume. And the unit of access maps to a business role rather than a scattered set of group memberships, which keeps both the policy model and the audit trail legible.
+This choice buys three things. Assignment is governed by Entra's own Entitlement Management policies, and access-package incompatibility relationships give Separation of Duties a natural platform-level home — the engine is designed to delegate SoD there rather than reimplement it, though that enforcement is planned, not yet configured (ADR-008, §5.4). Delivery is asynchronous and observable — a submitted request has a `state` the engine can poll to a terminal outcome rather than assume. And the unit of access maps to a business role rather than a scattered set of group memberships, which keeps both the policy model and the audit trail legible.
 
 ### 2.3 Layers With Single Responsibility
 
@@ -128,7 +128,7 @@ The Joiner pipeline runs as an ordered sequence of stages. A record only reaches
 9. **Post-provision verification.** The real, now-provisioned Entra ID object is checked against the intended entitlement set.
 10. **Audit report.** A structured report is written for the event regardless of outcome, and the Event Store lock is released.
 
-In the deployed Azure runtime, stages 6 through 10 execute as an Azure Durable Functions orchestration rather than one blocking call. The HTTP entry point returns `202 Accepted` immediately with a status URL, and an orchestrator drives the sequence — create user, wait for user propagation on a durable timer, submit the package requests, then poll delivery through a check-activity-and-timer loop before recording and finalizing. The two waits that were `time.sleep` calls in the synchronous path (user propagation and the delivery poll interval) become orchestrator timers that hold no compute, so a delivery that takes minutes completes rather than being cut off at the gateway timeout. The synchronous Joiner path is retained alongside the durable one; §7.8 covers the orchestration in full. The Mover and Leaver remain synchronous pending the same migration.
+In the deployed Azure runtime, stages 6 through 10 execute as an Azure Durable Functions orchestration rather than one blocking call. The HTTP entry point returns `202 Accepted` immediately with a status URL, and an orchestrator drives the sequence — create user, wait for user propagation on a durable timer, submit the package requests, then poll delivery through a check-activity-and-timer loop before recording and finalizing. The two waits that were `time.sleep` calls in the synchronous path (user propagation and the delivery poll interval) become orchestrator timers that hold no compute, so a delivery that takes minutes completes rather than being cut off at the gateway timeout. The synchronous Joiner path is retained alongside the durable one; §7.8 covers the orchestration in full. The Mover has since been migrated the same way (§3.2, §7.8); the Leaver remains synchronous pending the same migration.
 
 Separation of Duties is not a stage on this path. SoD enforcement is planned as a platform-level control in Entra Entitlement Management (§5.4), not a Python check inside the pipeline. When configured, a conflicting assignment surfaces as a `Denied` request state during delivery polling (stage 8) rather than as a separate gate before provisioning.
 
@@ -275,7 +275,7 @@ The engine reads from `RetentionRegistry` but does not write to it. Population r
 
 The Mover does not run a Python-side Separation of Duties check before executing access changes (ADR-008). SoD enforcement is delegated to the platform level — Entra ID Entitlement Management access package incompatibility policies. The intent is that when the engine submits an `adminAdd` request for a new package, Microsoft evaluates the configured incompatibility relationships and rejects the request if a conflict exists. Those incompatibility policies are not yet configured, so this enforcement point is planned rather than active (§5.4).
 
-A pre-flight incompatibility check (ADR-011) is designed but deferred. When built, it will query Entra's `incompatibleAccessPackages` and `incompatibleGroups` endpoints before submitting requests, and select between two execution strategies rather than always assuming add-first is safe. Until then, Strategy A (add-before-remove) is the only execution path, and a platform rejection surfaces through the polling step as a `Denied` or `Failed` requestState.
+A pre-flight incompatibility check (ADR-011) is designed but deferred. When built, it will query Entra's `incompatibleAccessPackages` and `incompatibleGroups` endpoints before submitting requests, and select between two execution strategies rather than always assuming add-first is safe. Until then, Strategy A (add-before-remove) is the only execution path, and a platform rejection surfaces through the polling step as a `denied` or `failed` delivery state. The durable execution model (§3.2.13) is built to accommodate ADR-011 without restructuring: its submit, check, and finalize activities are generic over an operation (add or remove), so a future remove-first Strategy B becomes an ordering branch in the orchestrator rather than a rewrite of the activities. That branch is not built — only the structure that would host it.
 
 ### 3.2.7 Execution Ordering — ADR-009
 
@@ -289,11 +289,13 @@ The gate is all-or-nothing: removals only proceed if every package in the additi
 
 ### 3.2.8 Package Assignment and Polling
 
-Each addition is submitted as an `adminAdd` request through the Entitlement Management `assignmentRequests` endpoint and polled to a terminal `requestState` (`Delivered`, `Denied`, `Failed`, or `Canceled`). This mirrors the Joiner's polling pattern.
+Each addition is submitted as an `adminAdd` request through the Entitlement Management `assignmentRequests` endpoint and polled to a terminal delivery state. The request's state is read from the `state` field on the `assignmentRequests` resource — lowercase values `delivered`, `denied`, `canceled`, or `failed` — not a `requestState` field, which does not exist on this resource. (An earlier revision polled `requestState`; because that field is always absent, the read returned empty and the poll never observed a terminal state, so every loop ran to its full window and only the fallback below recovered the true outcome. Reading `state` is what lets the poll terminate on actual delivery.) This mirrors the Joiner's polling pattern.
 
 A fallback confirmation mechanism addresses a recurring pattern observed in testing: transient network timeouts during polling that cause the engine to lose track of a request that Entra actually processed successfully. When polling does not reach a terminal state within the configured window, the engine queries the `assignments` resource directly (a different Graph endpoint from the one that timed out) to check whether the package was actually delivered. This is a genuine second opinion, not a retry of the same flaky call.
 
-Removals follow the same submit-and-poll pattern using `adminRemove` as the request type. The `policy_id` for each removal comes from the user's actual current assignment (captured at Step 1), not from re-resolving entitlements — the tenant state is the authoritative source for what policy governs an existing assignment.
+Removals follow the same submit-and-poll pattern using `adminRemove` as the request type, reading the same `state` field to a terminal value. The `policy_id` for each removal comes from the user's actual current assignment (captured at Step 1), not from re-resolving entitlements — the tenant state is the authoritative source for what policy governs an existing assignment.
+
+In the durable execution model (§3.2.13) both the addition poll and the removal poll are orchestrator-driven timer loops rather than blocking waits, so a delivery or removal that takes several minutes completes rather than being cut off at the gateway timeout. The submit-poll-finalize phase functions are identical between the synchronous and durable paths; only the owner of the wait differs.
 
 ### 3.2.9 Attribute Patching
 
@@ -360,6 +362,25 @@ sequenceDiagram
 | ADR-008 | SoD enforcement at the platform level | No Python SoD check before writes. Entra's own incompatibility policies are the intended enforcement point (planned, §5.4) |
 | ADR-009 | Add-before-remove ordering | Additions must be confirmed delivered before any removal executes. A failed addition never results in access loss |
 | ADR-011 | Pre-flight incompatibility check (deferred) | When built, queries Entra's configured incompatibility relationships to choose between add-first (Strategy A) and remove-first (Strategy B) per package |
+
+### 3.2.13 Durable Execution
+
+In the deployed Azure runtime the Mover runs as an Azure Durable Functions orchestration, the same execution model as the Joiner (§7.8) but with a shape the Joiner does not have: **two poll loops and a gate between them.** The synchronous Mover — submit additions, block on a `time.sleep` poll, gate, submit removals, block again — is retained unchanged alongside it; both compose one set of phase functions, differing only in who owns the waiting.
+
+The HTTP entry point (`mover-durable`) is a thin starter that returns `202 Accepted` with a status URL and hands off to the orchestrator; the caller never blocks. The orchestrator drives the sequence and owns every wait as a durable timer:
+
+```
+pre (claim → concurrent check → fetch current state + lock → resolve → delta → retention)
+  → submit additions → loop: check → all terminal? break : timer → finalize additions
+  → ADR-009 gate: all additions delivered?
+        yes → submit removals → loop: check → break/timer → finalize removals → patch attributes
+        no  → skip removals + attribute patch, record the deferral
+  → verify → finalize (audit + release lock)
+```
+
+Three properties matter here. First, the **ADR-009 gate is a branch in the orchestrator, never inside an activity** — the decision to run the removal loop depends on the result of the addition loop, and only the orchestrator sees both. This is the durable expression of the same add-before-remove rule §3.2.7 describes: it is enforced by control flow, not by an activity's internal logic. Second, **both poll loops are timer-driven** — where the synchronous path called `time.sleep` between polls, the orchestrator yields a durable timer that holds no compute, so an addition or removal that takes several minutes to deliver completes rather than being cut off at the HTTP gateway timeout. A Mover whose two loops together exceed that timeout — the exact case that fails synchronously — runs to completion while the orchestrator sleeps between checks. Third, the **submit, check, and finalize activities are generic over an operation** (add or remove) rather than bound to one; the orchestrator calls the same three activities twice with the operation flipped. This is what keeps a future ADR-011 remove-first Strategy B an ordering change in the orchestrator rather than a duplication of activities (§3.2.6) — the structure is built to host it, though Strategy B itself is not built.
+
+State crosses every activity boundary as plain serializable data. The `PendingPackage` record that tracks a request through submission and delivery is built from scalar fields only, so it moves between the submit, check, and finalize activities as a dictionary and reconstructs on the other side; the retention decisions cross as primitive dicts with dates already reduced to ISO strings. Nothing that holds a live client or a non-serializable object is passed across the boundary — the same discipline the Joiner's orchestration follows (§7.8).
 
 ---
 
@@ -867,9 +888,9 @@ The `assignments` resource (with its `state` field) and the `assignmentRequests`
 
 A `2xx` from Graph means the request was accepted. It does not mean the access exists. This distinction is the reason every pipeline ends with a verification step that re-fetches the real object: the Joiner confirms the provisioned user holds the intended packages, the Mover confirms the post-move assignment set matches the expected state, and the Leaver confirms the account is actually disabled and its packages actually cleared. Provisioning is only complete when the tenant says so, not when the API call returns.
 
-### 7.8 The Durable Orchestration — Implemented for the Joiner
+### 7.8 The Durable Orchestration — Implemented for the Joiner and Mover
 
-The submit-then-poll split was never just a loop; it is the seam the Durable Functions migration was designed around, and for the Joiner that migration is now built and deployed. The Joiner's provisioning runs as an Azure Durable Functions orchestration rather than one blocking synchronous call.
+The submit-then-poll split was never just a loop; it is the seam the Durable Functions migration was designed around, and for the Joiner and Mover that migration is now built and deployed. Both pipelines' provisioning runs as an Azure Durable Functions orchestration rather than one blocking synchronous call.
 
 The mechanism is a decomposition of the provisioning phases into sleep-free functions, driven by an orchestrator that owns every wait as a durable timer. Where the synchronous path called `time.sleep`, the orchestration yields a timer that holds no compute:
 
@@ -883,7 +904,7 @@ Each stage is a Durable *activity*; the orchestrator is the conductor. State cro
 
 The provisioning phase functions are shared, not duplicated: the synchronous `provision_joiner` composes them with `time.sleep`, and the orchestrator composes the same functions with timers. This is why the synchronous Joiner path can be retained unchanged alongside the durable one — both call one implementation, differing only in who owns the waiting.
 
-Two things remain on this seam. The **Mover and Leaver** still run their submit-then-poll (and, for the Leaver, its remove-and-poll) inline and synchronously; they await the same decomposition, and they are the pipelines that most need it, since their polling volume is higher. And the **deferred Leaver soft-delete** wants exactly the kind of background timer this orchestration model provides — a timer that returns later to finish work the first execution intentionally left pending — which it does not yet have (§7 of the Leaver, §11, §13).
+The **Mover** has since been migrated the same way, and because it polls twice — an addition loop and a removal loop, gated by ADR-009 — it is the pipeline that most exercised the model; §3.2.13 describes its orchestration. Two things remain on this seam. The **Leaver** still runs its remove-and-poll inline and synchronously; it awaits the same decomposition, and it is the remaining pipeline that needs it. And the **deferred Leaver soft-delete** wants exactly the kind of background timer this orchestration model provides — a timer that returns later to finish work the first execution intentionally left pending — which it does not yet have (§7 of the Leaver, §11, §13).
 
 ### 7.9 Permissions
 
@@ -1140,19 +1161,19 @@ The engine is deployed to Azure and runs there today, on an Azure Functions app 
 
 ### 11.1 Deployed
 
-- **Function app and triggers.** The pipelines run in an Azure Functions app (Flex Consumption). HTTP triggers serve Joiner, Mover, and Leaver on-demand runs. The Joiner additionally exposes a Durable Functions endpoint (`joiner-durable`) alongside its synchronous HTTP trigger.
+- **Function app and triggers.** The pipelines run in an Azure Functions app (Flex Consumption). HTTP triggers serve Joiner, Mover, and Leaver on-demand runs. The Joiner and Mover each additionally expose a Durable Functions endpoint (`joiner-durable`, `mover-durable`) alongside their synchronous HTTP triggers.
 
 - **CI/CD from source control.** GitHub Actions builds and deploys to the Azure Functions app on push, authenticated to Azure by **OIDC** — no stored publish credentials. This is the path every change ships through.
 
 - **Table Storage in Azure.** The engine's operational tables — `JmlEvents`, the hold queue, the Mover and Leaver event and audit logs, `RetentionRegistry` — live in the deployed storage account, partitioned as §6 and §8 describe.
 
-- **Durable Functions runtime for the Joiner.** The Joiner's provisioning runs as a Durable orchestration: user creation, a user-propagation timer, package submission, a check-and-timer delivery-poll loop, then record-and-finalize (§7.8). The waits that were blocking `time.sleep` calls are orchestrator timers, so a long delivery completes instead of hitting the gateway timeout.
+- **Durable Functions runtime for the Joiner and Mover.** The Joiner's provisioning runs as a Durable orchestration: user creation, a user-propagation timer, package submission, a check-and-timer delivery-poll loop, then record-and-finalize (§7.8). The Mover runs the same way with two poll loops — additions then removals — and the ADR-009 add-before-remove gate as an orchestrator branch between them (§3.2.13). The waits that were blocking `time.sleep` calls are orchestrator timers, so a long delivery completes instead of hitting the gateway timeout.
 
 ### 11.2 Remaining
 
 - **Managed Identity authentication.** Authentication is still `ClientSecretCredential` in both local and deployed environments. The planned change replaces it with a Managed Identity credential for all Graph and Azure Storage access; because the credential is constructed in one place per client, the swap is confined to those points (§7.1).
 
-- **Durable Functions for Mover and Leaver.** Only the Joiner is migrated. The Mover and Leaver still run their submit-then-poll inline and synchronously, and are the higher-polling-volume pipelines that most need the same treatment. This migration also gives the Leaver's deferred soft-delete the background timer it currently lacks (§7.8, §3.3).
+- **Durable Functions for the Leaver.** The Joiner and Mover are migrated; the Leaver still runs its remove-and-poll inline and synchronously and is the remaining pipeline that needs the same treatment. This migration also gives the Leaver's deferred soft-delete the background timer it currently lacks (§7.8, §3.3).
 
 - **Blob Storage for audit reports (immutability).** Joiner `DecisionReport` documents are written as local JSON today. The planned form writes them to a blob container under `reports/{year}/{month}/` with `overwrite=False` and an immutability/retention policy, so audit records cannot be altered or deleted — closing the gap §9.6 describes.
 
@@ -1184,18 +1205,18 @@ Honest architecture states what it does and what it does not. This section is th
 - Survives a throttled or transient-erroring tenant through a **retry layer** that respects `Retry-After` and backs off on server errors.
 - Ingests from **BambooHR (live, with delta polling) and CSV**, deriving the action against live Entra state.
 - **Runs in Azure.** The engine is deployed on Azure Functions (Flex Consumption) and ships through a **GitHub Actions CI/CD pipeline authenticated by OIDC**.
-- **Runs the Joiner as a Durable Functions orchestration** — timer-driven delivery polling, so a long assignment completes rather than hitting the HTTP gateway timeout (§7.8). The Mover and Leaver remain synchronous.
+- **Runs the Joiner and Mover as Durable Functions orchestrations** — timer-driven delivery polling, so a long assignment completes rather than hitting the HTTP gateway timeout (§7.8). The Mover polls twice (additions then removals) with the ADR-009 gate between the loops (§3.2.13). The Leaver remains synchronous.
 - **Fans out to downstream targets automatically on package delivery.** Because access is delivered through Access Packages, assignment triggers Entra's own provisioning: SCIM to **AWS IAM Identity Center** for the packaged applications, and native **Microsoft 365 groups** for **Teams and SharePoint** access. The engine assigns the package; Entra delivers the fan-out. This is the built, proven downstream path (distinct from the engine-owned SCIM connector in §13).
 
 ### 12.2 What the Engine Does Not Do
 
 - **Enforce Separation of Duties.** No pipeline runs an SoD check today. It is planned as platform-level enforcement in Entra Entitlement Management (ADR-008), not yet configured (§5.4).
 - **Run the governance validation gate.** The gate is currently decoupled and skipped in current runs; it is reintegrated once the PowerShell validation engine is itself deployed (§5.3, §11).
-- **Run the Mover and Leaver as Durable orchestrations.** Only the Joiner is migrated; the Mover and Leaver are still synchronous inline pipelines (§7.8, §11).
+- **Run the Leaver as a Durable orchestration.** The Joiner and Mover are migrated; the Leaver is still a synchronous inline pipeline (§7.8, §11).
 - **Authenticate with Managed Identity.** Both environments still use Microsoft Graph client credentials; Managed Identity and Key Vault secrets are planned (§7.1, §11).
 - **Store audit records immutably.** Records are written once by the engine, but Joiner reports are local JSON and the audit tables are updatable — storage-enforced immutability (write-once blob with a retention policy) is planned (§9.6, §11).
 - **Recover a partially failed Leaver.** A partial offboarding is visible and contained but not yet recoverable without manual intervention — there is no hold-queue equivalent, and the reclaim (ADR-013) and reconciliation (ADR-012) paths that would resume it are unbuilt (§8.5).
-- **Complete a deferred soft-delete on its own.** The configurable hold has no background timer; finishing the delete needs a re-run or the reconciliation path. The Joiner's durable runtime provides exactly this kind of timer, but the Leaver has not yet been migrated to use it (§7.8, §11).
+- **Complete a deferred soft-delete on its own.** The configurable hold has no background timer; finishing the delete needs a re-run or the reconciliation path. The Joiner's and Mover's durable runtime provides exactly this kind of timer, but the Leaver has not yet been migrated to use it (§7.8, §11).
 - **Write to the retention registry.** The engine reads `RetentionRegistry` but does not populate it — that requires an access request workflow. Entries are created manually today.
 - **Patch every attribute.** `usageLocation` (needs an ISO country code; the HR source sends city names) and `manager` (needs a separate Graph endpoint) are tracked but excluded from the write.
 - **Provision downstream through its own SCIM connector.** Downstream fan-out today is Entra-driven — package assignment triggers Entra's SCIM provisioning to AWS IAM Identity Center and its M365 group delivery to Teams/SharePoint (§12.1). What the engine does *not* do is own a SCIM connector of its own to arbitrary SaaS targets; that broader fan-out is future work (§13).

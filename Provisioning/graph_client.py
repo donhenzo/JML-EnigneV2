@@ -1222,31 +1222,55 @@ class JmlGraphClient:
     def disable_user(self, user_id: str) -> None:
         """
         Disable an Entra ID account (Leaver Step 2, ADR-015).
- 
-        Sets accountEnabled to False via a standard user PATCH — same
-        SDK pattern as create_user(), just flipping one field. This is
+
+        Sets accountEnabled to False via a standard user PATCH. Uses raw
+        httpx against the Graph REST endpoint — consistent with patch_user
+        and create_user, and avoids the SDK's event-loop lifecycle problems
+        on reused Azure Functions workers ('Event loop is closed'). This is
         the first Leaver action for a reason: if anything later in the
         pipeline fails, the account is already locked out (ADR-015).
- 
+
         Raises GraphClientError with status_code set.
         """
-        try:
-            user_patch = User()
-            user_patch.account_enabled = False
- 
-            self._run(
-                self._client.users.by_user_id(user_id).patch(user_patch)
+        import httpx
+
+        if self._credential is None:
+            raise GraphClientError(
+                "No credential available for disable_user HTTP call. "
+                "Ensure JmlGraphClient is constructed via build_graph_client()."
             )
- 
+
+        endpoint = f"https://graph.microsoft.com/v1.0/users/{user_id}"
+
+        try:
+            token = self._credential.get_token("https://graph.microsoft.com/.default")
+
+            response = httpx.patch(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {token.token}",
+                    "Content-Type":  "application/json",
+                },
+                json={"accountEnabled": False},
+                timeout=30,
+            )
+
+            if response.status_code not in (200, 204):
+                raise GraphClientError(
+                    f"disable_user failed — user_id={user_id}, "
+                    f"status={response.status_code}, body={response.text[:300]}",
+                    status_code=response.status_code,
+                )
+
             logger.info(f"User disabled — user_id={user_id}")
- 
+
         except GraphClientError:
             raise
         except Exception as e:
             status_code = _extract_status_code(e)
             raise GraphClientError(
                 f"disable_user failed — user_id={user_id}: {e}",
-                status_code=status_code
+                status_code=status_code,
             )
  
     @retry_on_throttle(max_retries=3, base_backoff=2.0)
@@ -1304,27 +1328,53 @@ class JmlGraphClient:
     def delete_user(self, user_id: str) -> None:
         """
         Soft delete a user (Leaver Step 6, ADR-015).
- 
-        Standard Graph DELETE — Entra moves the object to the
-        deleted-users container, recoverable for 30 days by default.
-        This is the one Leaver action treated as non-urgent: everything
-        before it in the pipeline has already cut off access, so a
-        configurable hold before this call (see leaver_http Step 6) is
-        safe.
- 
+
+        Standard Graph DELETE — Entra moves the object to the deleted-users
+        container, recoverable for 30 days by default. Uses raw httpx against
+        the Graph REST endpoint — consistent with the rest of this client,
+        and avoids the SDK's event-loop lifecycle problems on reused Azure
+        Functions workers ('Event loop is closed'). This is the one Leaver
+        action treated as non-urgent: everything before it has already cut
+        off access, so a configurable hold before this call (leaver_http
+        Step 6) is safe.
+
         Raises GraphClientError with status_code set.
         """
+        import httpx
+
+        if self._credential is None:
+            raise GraphClientError(
+                "No credential available for delete_user HTTP call. "
+                "Ensure JmlGraphClient is constructed via build_graph_client()."
+            )
+
+        endpoint = f"https://graph.microsoft.com/v1.0/users/{user_id}"
+
         try:
-            self._run(self._client.users.by_user_id(user_id).delete())
+            token = self._credential.get_token("https://graph.microsoft.com/.default")
+
+            response = httpx.delete(
+                endpoint,
+                headers={"Authorization": f"Bearer {token.token}"},
+                timeout=30,
+            )
+
+            if response.status_code not in (200, 204):
+                raise GraphClientError(
+                    f"delete_user failed — user_id={user_id}, "
+                    f"status={response.status_code}, body={response.text[:300]}",
+                    status_code=response.status_code,
+                )
+
             logger.info(f"User soft-deleted — user_id={user_id}")
- 
+
         except GraphClientError:
             raise
         except Exception as e:
             status_code = _extract_status_code(e)
             raise GraphClientError(
                 f"delete_user failed — user_id={user_id}: {e}",
-                status_code=status_code
+                status_code=status_code,
             )
  
     @retry_on_throttle(max_retries=3, base_backoff=2.0)
