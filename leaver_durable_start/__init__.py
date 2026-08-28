@@ -1,0 +1,1 @@
+from Leaver.durable.starter import start as main

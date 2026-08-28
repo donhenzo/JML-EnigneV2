@@ -1,0 +1,1 @@
+from Leaver.durable.activities import verify_finalize as main

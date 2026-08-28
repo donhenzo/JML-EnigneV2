@@ -1,0 +1,1 @@
+from Leaver.durable.activities import finalize as main
