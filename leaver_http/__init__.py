@@ -1,99 +1,85 @@
 """
 Functions/leaver_http/__init__.py
 
-Azure Function HTTP trigger for the Leaver module.
+Azure Function HTTP trigger for the Leaver module — thin synchronous driver.
 
 Orchestrates offboarding for a single identity lifecycle event. Called
 directly via HTTP or by the BambooHR ingestion coordinator when action
 derivation returns JmlAction.LEAVER.
 
+This module holds no business logic. It composes the stages in Leaver/stages.py
+and the removal seam in Leaver/provisioning_phases.py, owns the audit_record
+dict and every Table Storage write, and owns the removal poll wait as a
+time.sleep loop. The Durable orchestrator (a later step) composes the same
+stages and phases with durable timers instead of time.sleep — the two paths
+share one implementation and differ only in who owns the waiting.
+
 Processing flow (ADR-015):
 
-    Pre-Step  — Supersede any pending Joiner/Mover events for this
-                employee (conflict_queue). claim_event() in JmlEvents.
-                Atomic insert — duplicate event ID exits immediately.
-
-    Step 1    — User fetch and current access package assignment fetch
-                via Graph. acquire_lock() written to JmlEvents on
-                success.
-    Step 2    — Disable account (accountEnabled = false). First action
-                taken, so a downstream failure still fails safe.
+    Pre-Step  — claim_event() in JmlEvents (atomic; duplicate exits).
+                check_and_handle_conflict() supersedes pending Joiner/Mover
+                events for this employee.
+    Step 1    — Concurrent-event guard, then user + current package fetch,
+                then acquire_lock().
+    Step 2    — Disable account (accountEnabled=false). First mutation, so a
+                downstream failure still fails safe.
     Step 3    — Revoke all sign-in sessions.
-    Step 4    — Remove every currently held access package (ADR-014 —
-                no retention check, no unmanaged exclusion; everything
-                goes).
-    Step 5    — Terminate any active PIM group sessions, discovered
-                live from the tenant rather than derived from policy
-                (ADR-014 removes entitlement resolution for Leaver).
-                Departs from ADR-003's "let it expire naturally" — see
-                ADR-016.
-    Step 6    — Soft delete the user, subject to a configurable hold
-                period.
-    Step 7    — Post-offboarding verification against real tenant
-                state.
-    Step 8    — LeaverAuditRecord written. release_lock(). JmlEvents
-                updated to Completed or Failed.
+    Step 4    — Remove every currently held access package (ADR-014).
+    Step 5    — Terminate active PIM group sessions (ADR-016).
+    Step 6    — Soft delete the user, subject to a configurable hold.
+    Step 7    — Post-offboarding verification against real tenant state.
+    Step 8    — LeaverAuditRecord written. release_lock(). JmlEvents updated.
 
 The JmlEvents lock is released on every exit path.
-
-NOTE — why this pipeline has no entitlement resolution, no delta, and
-no retention step, unlike the Mover (ADR-014):
-    A Leaver has no target state to resolve towards. Its target is
-    simply "remaining = current − everything". Retention exists to
-    bridge a role transition, which a termination is not; an unmanaged
-    package on a terminated identity is exactly the kind of leftover
-    access offboarding exists to catch, not something to preserve.
-    See ADR-014 for the full reasoning.
-
-NOTE — why the step order differs from the Mover's add-before-remove
-(ADR-009) despite superficially resembling it (ADR-015):
-    ADR-009 protects against a zero-access failure mode during a role
-    change. The Leaver has the opposite goal — it wants to *reach* zero
-    access, safely — so it disables and revokes sessions before
-    touching package assignments: a partial failure downstream then
-    fails safe (account already locked out) rather than failing open.
 """
 
 from __future__ import annotations
 import json
 import logging
 import os
-import uuid as _uuid
-from datetime import datetime, timezone, timedelta
-from typing import Optional
+import time
+from datetime import datetime, timezone
 
 from azure.data.tables import TableServiceClient, TableClient
 
 from Ingestion.schema import IdentityPayload, JmlAction, EmploymentType
-from Provisioning.graph_client import JmlGraphClient, GraphClientError, build_graph_client
-from Provisioning.package_requests import poll_request_until_terminal
+from Provisioning.graph_client import JmlGraphClient, build_graph_client
 from Functions.Event_store.event_store import (
     get_events_table_client,
     generate_event_id,
-    claim_event,
-    acquire_lock,
     release_lock,
     update_event_status,
     EventStatus,
 )
-from Functions.Event_store.conflict_queue import (
-    check_and_handle_conflict,
-    ConflictOutcome,
+from Leaver.stage_result import StageOutcome
+from Leaver.stages import (
+    stage_claim,
+    stage_conflict_check,
+    stage_concurrent_check,
+    stage_fetch_current_state,
+    stage_disable,
+    stage_revoke,
+    stage_pim_terminate,
+    stage_soft_delete,
+    stage_verify,
+)
+from Leaver.provisioning_phases import (
+    submit_removals,
+    poll_packages_once,
+    packages_all_terminal,
+    finalize_removals,
 )
 
 logger = logging.getLogger(__name__)
 
-
-# Table names and constants
 LEAVER_EVENT_LOG_TABLE = "LeaverEventLog"
 LEAVER_AUDIT_LOG_TABLE = "LeaverAuditLog"
 
-# Days to hold before soft-deleting the user object (Step 6). Everything
-# before this step has already cut off access, so a nonzero hold is safe
-# — it just gives operators a window for manual review before the
-# identity leaves the directory. Default is immediate deletion.
-SOFT_DELETE_HOLD_DAYS = int(os.environ.get("JML_LEAVER_SOFT_DELETE_HOLD_DAYS", "0"))
-STALE_LOCK_MINUTES = 10
+# Removal poll window — same env vars and defaults the Joiner and Mover use, so
+# the sync driver and the future durable orchestrator share one window.
+POLL_MAX_ATTEMPTS      = int(os.environ.get("JML_PACKAGE_POLL_MAX_ATTEMPTS", "60"))
+POLL_INTERVAL_SECONDS  = int(os.environ.get("JML_PACKAGE_POLL_INTERVAL_SECONDS", "5"))
+
 
 class LeaverEventStatus:
     RECEIVED          = "RECEIVED"
@@ -108,59 +94,6 @@ class LeaverEventStatus:
 
 def _get_table_client(connection_string: str) -> TableServiceClient:
     return TableServiceClient.from_connection_string(connection_string)
-
-
-def _is_stale_in_progress(row: dict) -> bool:
-    """
-    True if an IN_PROGRESS event log row is older than STALE_LOCK_MINUTES.
-
-    A 504-killed run leaves its EventLog row IN_PROGRESS with no terminal
-    write. Without this, the reclaimed retry is blocked as QUEUED_CONCURRENT
-    even though the JmlEvents lock has already been reclaimed. Same staleness
-    window as the event store lock, so both agree on when a run is dead.
-    """
-    updated_at = row.get("updated_at", "")
-    if not updated_at:
-        return False
-    try:
-        updated = datetime.fromisoformat(updated_at)
-        if updated.tzinfo is None:
-            updated = updated.replace(tzinfo=timezone.utc)
-        return datetime.now(timezone.utc) - updated > timedelta(minutes=STALE_LOCK_MINUTES)
-    except (ValueError, TypeError):
-        return True
-
-
-def _check_concurrent_event(
-    table_client: TableServiceClient,
-    employee_id:  str,
-) -> bool:
-    """..."""
-    try:
-        client   = table_client.get_table_client(LEAVER_EVENT_LOG_TABLE)
-        entities = client.query_entities(
-            query_filter=(
-                f"PartitionKey eq '{employee_id}' "
-                f"and status eq 'IN_PROGRESS'"
-            )
-        )
-        for row in entities:
-            if _is_stale_in_progress(row):
-                logger.warning(
-                    "Stale IN_PROGRESS event log row ignored — employee=%s, "
-                    "event=%s, updated_at=%s. Prior run likely killed before "
-                    "terminal write (504). Allowing reclaimed retry to proceed.",
-                    employee_id, row.get("RowKey", ""), row.get("updated_at", ""),
-                )
-                continue
-            return True
-        return False
-    except Exception as e:
-        logger.error(
-            "LeaverEventLog concurrent check failed — employee=%s, error=%s",
-            employee_id, str(e),
-        )
-        return True
 
 
 def _write_event_log(
@@ -182,8 +115,7 @@ def _write_event_log(
         client.upsert_entity(entity)
     except Exception as e:
         logger.error(
-            "LeaverEventLog write failed — employee=%s, event=%s, "
-            "status=%s, error=%s",
+            "LeaverEventLog write failed — employee=%s, event=%s, status=%s, error=%s",
             employee_id, event_id, status, str(e),
         )
 
@@ -197,9 +129,8 @@ def _write_audit_record(
     """
     Write the completed LeaverAuditRecord to LeaverAuditLog.
 
-    Table Storage only accepts flat scalar values. Nested dicts and
-    lists are serialised to JSON strings before writing — same pattern
-    as MoverAuditLog.
+    Table Storage only accepts flat scalar values. Nested dicts and lists are
+    serialised to JSON strings before writing — same pattern as MoverAuditLog.
     """
     try:
         client = table_client.get_table_client(LEAVER_AUDIT_LOG_TABLE)
@@ -219,9 +150,7 @@ def _write_audit_record(
         )
 
 
-# Step 4 — full package removal (ADR-014: everything, no exclusions)
-
-def _execute_full_removal(
+def _run_removal_loop(
     graph_client:       JmlGraphClient,
     user_id:            str,
     current_packages:   frozenset[str],
@@ -229,179 +158,32 @@ def _execute_full_removal(
     package_labels:     dict[str, str],
 ) -> list[dict]:
     """
-    Submit adminRemove for every currently held access package.
-
-    No retention check, no unmanaged exclusion (ADR-014) — a Leaver
-    removes everything the user holds, including packages the engine
-    doesn't otherwise manage, because unmanaged access on a terminated
-    identity is exactly the risk offboarding exists to catch.
-
-    Individual failures are recorded but do not stop remaining
-    removals. Step 7 verification surfaces whatever didn't clear.
+    Step 4 — submit every adminRemove, poll to terminal with a time.sleep wait
+    between passes, then finalize. This is the synchronous composition of the
+    removal seam; the durable orchestrator composes the same phase functions
+    with timers. The wait lives here in the caller, never in the phases.
     """
-    actions_taken: list[dict] = []
-    removed_count = 0
-    failed_count = 0
-
-    for package_id in current_packages:
-        label = package_labels.get(package_id, package_id)
-        policy_id = current_policy_map.get(package_id, "")
-
-        if not policy_id:
-            logger.warning(
-                "  ⚠ %s — no assignmentPolicyId on the current assignment, "
-                "submitting adminRemove with an empty policy_id anyway",
-                label,
-            )
-
-        try:
-            request = graph_client.request_package_assignment(
-                user_id=user_id,
-                access_package_id=package_id,
-                policy_id=policy_id,
-                request_type="adminRemove",
-            )
-            request_id  = request.get("id", "")
-            final_state = poll_request_until_terminal(graph_client, request_id)
-
-            if final_state == "Delivered":
-                removed_count += 1
-                actions_taken.append({
-                    "action":     "PackageRemoval",
-                    "package_id": package_id,
-                    "detail":     "Removed successfully",
-                    "succeeded":  True,
-                })
-                logger.info("  ✓ %s — removed", label)
-                continue
-
-            # Same fallback pattern as the Mover — a poll that didn't
-            # reach a terminal state is not the same thing as a real
-            # failure. Ask the assignments resource directly.
-            fallback = graph_client.check_package_assignment(
-                user_id=user_id,
-                access_package_id=package_id,
-            )
-            if not fallback or fallback.get("state") != "delivered":
-                removed_count += 1
-                actions_taken.append({
-                    "action":     "PackageRemoval",
-                    "package_id": package_id,
-                    "detail":     f"Removed — confirmed via fallback check (last known state={final_state})",
-                    "succeeded":  True,
-                })
-                logger.info(
-                    "  ✓ %s — removed (confirmed via fallback check)", label
-                )
-            else:
-                failed_count += 1
-                actions_taken.append({
-                    "action":     "PackageRemoval",
-                    "package_id": package_id,
-                    "detail":     f"Removal did not confirm — requestState={final_state}, fallback check still shows delivered",
-                    "succeeded":  False,
-                })
-                logger.warning(
-                    "  ✗ %s — removal did not confirm (requestState=%s)",
-                    label, final_state,
-                )
-
-        except GraphClientError as e:
-            failed_count += 1
-            actions_taken.append({
-                "action":     "PackageRemoval",
-                "package_id": package_id,
-                "detail":     f"Removal failed: {str(e)}",
-                "succeeded":  False,
-            })
-            logger.warning("  ✗ %s — removal failed: %s", label, str(e))
-
-    if current_packages:
-        logger.info(
-            "Step 4 complete — %d removed, %d failed",
-            removed_count, failed_count,
-        )
-
-    return actions_taken
-
-
-# Step 5 — PIM session termination (ADR-016)
-
-def _execute_pim_termination(
-    graph_client: JmlGraphClient,
-    user_id:      str,
-    employee_id:  str,
-) -> tuple[list[dict], list[str]]:
-    """
-    Discover and terminate every active PIM group session for this
-    user, tenant-wide.
-
-    Discovery is live (get_active_pim_assignments_for_user), not
-    policy-derived — the Leaver has no entitlement resolution to draw
-    a candidate group list from (ADR-014). A missing P2 licence, or
-    any other failure to even check, is recorded as a warning and does
-    not block the rest of offboarding — PIM eligibility is a bonus
-    control on top of package removal, not the primary one.
-    """
-    actions_taken: list[dict] = []
-    warnings: list[str] = []
-
-    try:
-        active_sessions = graph_client.get_active_pim_assignments_for_user(user_id)
-    except GraphClientError as e:
-        warnings.append(
-            f"PIM active-session check failed (P2 may be absent, or a "
-            f"real Graph error): {str(e)}. Skipping PIM termination."
-        )
-        logger.warning(
-            "  ⚠ PIM active-session check failed — employee=%s, error=%s",
-            employee_id, str(e),
-        )
-        return actions_taken, warnings
-
-    if not active_sessions:
-        logger.info("Step 5 — no active PIM sessions found")
-        return actions_taken, warnings
-
-    terminated_count = 0
-    failed_count = 0
-
-    for session in active_sessions:
-        group_id = session.get("group_id", "")
-        if not group_id:
-            continue
-        try:
-            graph_client.cancel_pim_session(
-                user_id=user_id,
-                group_id=group_id,
-                justification=f"Leaver offboarding — employee {employee_id}",
-            )
-            terminated_count += 1
-            actions_taken.append({
-                "action":   "PIMSessionTerminated",
-                "group_id": group_id,
-                "detail":   "Active session cancelled",
-                "succeeded": True,
-            })
-            logger.info("  ✓ PIM session on group %s — terminated", group_id)
-        except GraphClientError as e:
-            failed_count += 1
-            actions_taken.append({
-                "action":   "PIMSessionTerminated",
-                "group_id": group_id,
-                "detail":   f"Termination failed: {str(e)}",
-                "succeeded": False,
-            })
-            logger.warning(
-                "  ✗ PIM session on group %s — termination failed: %s",
-                group_id, str(e),
-            )
-
-    logger.info(
-        "Step 5 complete — %d terminated, %d failed",
-        terminated_count, failed_count,
+    pending = submit_removals(
+        graph_client=graph_client,
+        user_id=user_id,
+        current_packages=current_packages,
+        current_policy_map=current_policy_map,
+        package_labels=package_labels,
     )
-    return actions_taken, warnings
+
+    for _ in range(POLL_MAX_ATTEMPTS):
+        if packages_all_terminal(pending):
+            break
+        poll_packages_once(pending, graph_client)
+        if packages_all_terminal(pending):
+            break
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    return finalize_removals(
+        graph_client=graph_client,
+        user_id=user_id,
+        pending=pending,
+    )
 
 
 # Main orchestrator
@@ -414,34 +196,23 @@ def run_leaver_pipeline(
     """
     Execute the Leaver offboarding flow for a single identity event.
 
-    The EventId is generated internally from the payload, same as the
-    Mover — event ownership stays inside the pipeline, not the
-    ingestion layer.
+    The EventId is generated internally from the payload, same as the Mover —
+    event ownership stays inside the pipeline, not the ingestion layer.
 
-    Args:
-        payload:      Canonical IdentityPayload with action=LEAVER.
-                      start_date is treated as the termination date for
-                      event ID generation. department/job_title are not
-                      used — there is no entitlement resolution (ADR-014).
-        table_client: Authenticated TableServiceClient for Table Storage.
-        graph_client: Authenticated JmlGraphClient for Graph API ops.
-
-    Returns:
-        dict with final_status, employee_id, event_id, and summary.
+    Returns a dict with final_status, employee_id, event_id, and summary.
     """
     if payload.action != JmlAction.LEAVER:
         raise ValueError(
             f"run_leaver_pipeline called with action={payload.action!r}, "
-            f"expected JmlAction.LEAVER. Refusing to run offboarding "
-            f"logic against a non-Leaver payload."
+            f"expected JmlAction.LEAVER. Refusing to run offboarding logic "
+            f"against a non-Leaver payload."
         )
 
     employee_id = payload.employee_id
-    event_id = generate_event_id(
-        employee_id,
-        "Leaver",
-        payload.start_date.isoformat(),
-    )
+    event_id = generate_event_id(employee_id, "Leaver", payload.start_date.isoformat())
+
+    conn_str          = os.environ.get("JML_STORAGE_CONNECTION_STRING", "")
+    jml_events_client = get_events_table_client(conn_str)
 
     audit_record: dict = {
         "event_type":      "LEAVER",
@@ -454,174 +225,75 @@ def run_leaver_pipeline(
         "offboard_status": LeaverEventStatus.RECEIVED,
     }
 
-    # Pre-Step — claim event, then check for conflicts.
-    # The conflict queue needs the event to exist in JmlEvents before it
-    # can reason about it, so claim first, then check. When the new action
-    # is "Leaver", check_and_handle_conflict supersedes all Pending events
-    # for this employee and returns SUPERSEDE — meaning "you have priority,
-    # proceed." It does NOT mean "you were superseded."
-    conn_str          = os.environ.get("JML_STORAGE_CONNECTION_STRING", "")
-    jml_events_client = get_events_table_client(conn_str)
-
-    payload_json_str = json.dumps({
-        "employee_id": employee_id,
-        "action":      "Leaver",
-        "event_id":    event_id,
-    })
-
-    claimed = claim_event(
-        table_client   = jml_events_client,
-        employee_id    = employee_id,
-        action         = "Leaver",
-        start_date     = payload.start_date.isoformat(),
-        payload_json   = payload_json_str,
-        correlation_id = event_id,
-    )
-
-    if not claimed:
+    # Pre-Step — claim, then conflict supersede.
+    claim = stage_claim(payload, event_id=event_id, jml_events_client=jml_events_client)
+    if claim.outcome == StageOutcome.DUPLICATE:
         logger.info(
-            "Leaver event already claimed in JmlEvents — idempotency exit — "
-            "employee=%s", employee_id,
+            "Leaver event already claimed in JmlEvents — idempotency exit — employee=%s",
+            employee_id,
         )
         return {
             "final_status": LeaverEventStatus.QUEUED_CONCURRENT,
             "employee_id":  employee_id,
             "event_id":     event_id,
-            "summary":      "Duplicate event — already claimed in JmlEvents.",
+            "summary":      claim.summary,
         }
 
-    # Conflict check — for a Leaver this supersedes any pending
-    # Joiner/Mover events, then returns SUPERSEDE (meaning "proceed
-    # with priority"). A non-Leaver would get QUEUED if something is
-    # already in flight — but a Leaver never queues behind anything.
-    conflict_outcome = check_and_handle_conflict(
-        table_client = jml_events_client,
-        employee_id  = employee_id,
-        new_event_id = event_id,
-        new_action   = "Leaver",
-    )
-    logger.info(
-        "Conflict check — employee=%s, outcome=%s",
-        employee_id, conflict_outcome,
-    )
+    stage_conflict_check(payload, event_id=event_id, jml_events_client=jml_events_client)
 
-
-    # Step 1 — current state discovery + concurrent check
-
+    # Step 1 — concurrent guard, then current-state discovery + lock.
     logger.info("Leaver Step 1 — current state discovery — employee=%s", employee_id)
 
-    is_concurrent = _check_concurrent_event(table_client, employee_id)
-    if is_concurrent:
+    concurrent = stage_concurrent_check(payload, table_client=table_client)
+    if concurrent.outcome == StageOutcome.QUEUED:
         logger.warning(
-            "Concurrent Leaver event detected — employee=%s, "
-            "queuing with status QUEUED_CONCURRENT", employee_id,
+            "Concurrent Leaver event detected — employee=%s, queuing with "
+            "status QUEUED_CONCURRENT", employee_id,
         )
-        _write_event_log(
-            table_client, employee_id, event_id, LeaverEventStatus.QUEUED_CONCURRENT
-        )
+        _write_event_log(table_client, employee_id, event_id, LeaverEventStatus.QUEUED_CONCURRENT)
         return {
             "final_status": LeaverEventStatus.QUEUED_CONCURRENT,
             "employee_id":  employee_id,
             "event_id":     event_id,
-            "summary":      "Event queued — another Leaver event is in progress for this employee.",
+            "summary":      concurrent.summary,
         }
 
     _write_event_log(table_client, employee_id, event_id, LeaverEventStatus.IN_PROGRESS)
 
-    try:
-        current_user = graph_client.get_user(payload.upn)
-        user_id      = current_user["id"]
-    except GraphClientError as e:
-        logger.error(
-            "Step 1 failed — user fetch failed — employee=%s, error=%s",
-            employee_id, str(e),
-        )
+    fetch = stage_fetch_current_state(
+        payload, event_id=event_id,
+        graph_client=graph_client, jml_events_client=jml_events_client,
+    )
+    if fetch.outcome == StageOutcome.FAILED:
+        reason = fetch.report_warnings[0] if fetch.report_warnings else fetch.summary
+        logger.error("Step 1 failed — %s — employee=%s", fetch.data.get("failure_step"), employee_id)
         return _handle_early_failure(
             table_client, jml_events_client, employee_id, event_id,
-            audit_record, f"User fetch failed: {str(e)}",
-            failure_step="UserFetch", lock_acquired=False,
+            audit_record, reason,
+            failure_step=fetch.data.get("failure_step", "Step1"),
+            lock_acquired=fetch.data.get("lock_acquired", False),
         )
 
-    try:
-        current_assignments = graph_client.get_current_access_package_assignments(
-            user_id=user_id,
-        )
-        current_packages = frozenset(
-            a["accessPackage"]["id"]
-            for a in current_assignments
-            if a.get("accessPackage", {}).get("id")
-        )
-        current_policy_map = {
-            a["accessPackage"]["id"]: a.get("assignmentPolicy", {}).get("id", "")
-            for a in current_assignments
-            if a.get("accessPackage", {}).get("id")
-        }
-        package_labels: dict[str, str] = {
-            a["accessPackage"]["id"]: a["accessPackage"].get("displayName", a["accessPackage"]["id"])
-            for a in current_assignments
-            if a.get("accessPackage", {}).get("id")
-        }
-    except GraphClientError as e:
-        logger.error(
-            "Step 1 failed — access package assignment fetch failed — "
-            "employee=%s, error=%s", employee_id, str(e),
-        )
-        return _handle_early_failure(
-            table_client, jml_events_client, employee_id, event_id,
-            audit_record, f"Access package assignment fetch failed: {str(e)}",
-            failure_step="AccessPackageAssignmentFetch", lock_acquired=False,
-        )
+    user_id            = fetch.data["user_id"]
+    current_packages   = frozenset(fetch.data["current_packages"])
+    current_policy_map = fetch.data["current_policy_map"]
+    package_labels     = fetch.data["package_labels"]
 
     audit_record["packages_at_offboard_start"] = list(current_packages)
 
-    instance_id = str(_uuid.uuid4())
-    acquire_lock(
-        table_client=jml_events_client, employee_id=employee_id,
-        event_id=event_id, instance_id=instance_id,
-    )
-
-
-    # Step 2 — disable account
-
+    # Step 2 — disable account.
     logger.info("Leaver Step 2 — disable account — employee=%s", employee_id)
+    disable = stage_disable(payload, user_id=user_id, graph_client=graph_client)
+    _apply_stage_reports(audit_record, disable)
 
-    try:
-        graph_client.disable_user(user_id)
-        audit_record["actions_taken"].append({
-            "action": "AccountDisabled", "detail": "accountEnabled=false", "succeeded": True,
-        })
-        logger.info("  ✓ account disabled")
-    except GraphClientError as e:
-        audit_record["actions_taken"].append({
-            "action": "AccountDisabled", "detail": str(e), "succeeded": False,
-        })
-        audit_record["warnings"].append(f"Account disable failed: {str(e)}")
-        logger.warning("  ✗ account disable failed: %s", str(e))
-
-
-    # Step 3 — revoke sessions
-
+    # Step 3 — revoke sessions.
     logger.info("Leaver Step 3 — revoke sessions — employee=%s", employee_id)
+    revoke = stage_revoke(payload, user_id=user_id, graph_client=graph_client)
+    _apply_stage_reports(audit_record, revoke)
 
-    try:
-        graph_client.revoke_sessions(user_id)
-        audit_record["actions_taken"].append({
-            "action": "SessionsRevoked", "detail": "revokeSignInSessions", "succeeded": True,
-        })
-        logger.info("  ✓ sessions revoked")
-    except GraphClientError as e:
-        audit_record["actions_taken"].append({
-            "action": "SessionsRevoked", "detail": str(e), "succeeded": False,
-        })
-        audit_record["warnings"].append(f"Session revocation failed: {str(e)}")
-        logger.warning("  ✗ session revocation failed: %s", str(e))
-
-
-    # Step 4 — remove all access packages (ADR-014)
-
+    # Step 4 — remove all access packages (ADR-014).
     logger.info("Leaver Step 4 — access package removal — employee=%s", employee_id)
-
-    removal_actions = _execute_full_removal(
+    removal_actions = _run_removal_loop(
         graph_client=graph_client, user_id=user_id,
         current_packages=current_packages,
         current_policy_map=current_policy_map,
@@ -641,94 +313,31 @@ def run_leaver_pipeline(
             f"removal: {packages_removal_failed}"
         )
 
-
-    # Step 5 — PIM session termination (ADR-016)
-
+    # Step 5 — PIM session termination (ADR-016).
     logger.info("Leaver Step 5 — PIM session termination — employee=%s", employee_id)
+    pim = stage_pim_terminate(payload, user_id=user_id, graph_client=graph_client)
+    _apply_stage_reports(audit_record, pim)
 
-    pim_actions, pim_warnings = _execute_pim_termination(
-        graph_client=graph_client, user_id=user_id, employee_id=employee_id,
-    )
-    audit_record["actions_taken"].extend(pim_actions)
-    audit_record["warnings"].extend(pim_warnings)
-
-
-    # Step 6 — soft delete (configurable hold)
-
+    # Step 6 — soft delete (configurable hold).
     logger.info("Leaver Step 6 — soft delete — employee=%s", employee_id)
+    soft_delete = stage_soft_delete(payload, user_id=user_id, graph_client=graph_client)
+    _apply_stage_reports(audit_record, soft_delete)
+    user_deleted = soft_delete.data.get("user_deleted", False)
 
-    user_deleted = False
-    if SOFT_DELETE_HOLD_DAYS <= 0:
-        try:
-            graph_client.delete_user(user_id)
-            user_deleted = True
-            audit_record["actions_taken"].append({
-                "action": "SoftDelete", "detail": "User moved to deleted-users container",
-                "succeeded": True,
-            })
-            logger.info("  ✓ user soft-deleted")
-        except GraphClientError as e:
-            audit_record["actions_taken"].append({
-                "action": "SoftDelete", "detail": str(e), "succeeded": False,
-            })
-            audit_record["warnings"].append(f"Soft delete failed: {str(e)}")
-            logger.warning("  ✗ soft delete failed: %s", str(e))
-    else:
-        audit_record["warnings"].append(
-            f"Soft delete deferred {SOFT_DELETE_HOLD_DAYS} day(s) per "
-            f"JML_LEAVER_SOFT_DELETE_HOLD_DAYS policy — not yet deleted."
-        )
-        logger.info(
-            "  ⊘ soft delete deferred %d day(s) per policy",
-            SOFT_DELETE_HOLD_DAYS,
-        )
-
-
-    # Step 7 — post-offboarding verification
-
+    # Step 7 — post-offboarding verification.
     logger.info("Leaver Step 7 — post-offboarding verification — employee=%s", employee_id)
+    verify = stage_verify(
+        payload, user_id=user_id, user_deleted=user_deleted,
+        packages_removal_failed=packages_removal_failed, graph_client=graph_client,
+    )
+    _apply_stage_reports(audit_record, verify)
+    audit_record["post_offboard_verification"] = verify.data["audit_post_offboard_verification"]
 
-    verification_error = False
-    account_disabled_confirmed = False
-    packages_cleared = not packages_removal_failed
+    verification_error         = verify.data["verification_error"]
+    account_disabled_confirmed = verify.data["account_disabled_confirmed"]
+    packages_cleared           = verify.data["packages_cleared"]
 
-    if user_deleted:
-        try:
-            graph_client.get_user(payload.upn)
-            # Still resolvable right after a soft delete — Graph can lag.
-            # Not fatal on its own; recorded as a discrepancy, not a hard
-            # verification error, since the delete call itself succeeded.
-            audit_record["warnings"].append(
-                "User still resolvable via get_user() immediately after "
-                "soft delete — likely Graph propagation lag, not a failed delete."
-            )
-        except GraphClientError:
-            account_disabled_confirmed = True  # deleted implies disabled
-    else:
-        try:
-            refetched = graph_client.get_user(payload.upn)
-            account_disabled_confirmed = refetched.get("account_enabled") is False
-            if not account_disabled_confirmed:
-                audit_record["warnings"].append(
-                    "Post-offboarding check: account does not show as "
-                    "disabled on re-fetch."
-                )
-        except GraphClientError as e:
-            verification_error = True
-            audit_record["warnings"].append(
-                f"Post-offboarding user re-fetch failed: {str(e)}"
-            )
-
-    audit_record["post_offboard_verification"] = {
-        "account_disabled_confirmed": account_disabled_confirmed,
-        "packages_cleared":           packages_cleared,
-        "user_deleted":               user_deleted,
-        "soft_delete_deferred":       SOFT_DELETE_HOLD_DAYS > 0,
-    }
-
-
-    # Step 8 — final status + audit record
-
+    # Step 8 — final status + audit record.
     logger.info("Leaver Step 8 — audit reporting — employee=%s", employee_id)
 
     if verification_error:
@@ -757,10 +366,7 @@ def run_leaver_pipeline(
         ),
     )
 
-    logger.info(
-        "Leaver pipeline complete — employee=%s, status=%s",
-        employee_id, final_status,
-    )
+    logger.info("Leaver pipeline complete — employee=%s, status=%s", employee_id, final_status)
 
     return {
         "final_status": final_status,
@@ -771,6 +377,14 @@ def run_leaver_pipeline(
 
 
 # Helpers
+
+def _apply_stage_reports(audit_record: dict, result) -> None:
+    """Fold a stage's report_actions and report_warnings into the audit_record."""
+    if result.report_actions:
+        audit_record["actions_taken"].extend(result.report_actions)
+    if result.report_warnings:
+        audit_record["warnings"].extend(result.report_warnings)
+
 
 def _fail(employee_id: str, event_id: str, reason: str) -> dict:
     return {
@@ -792,9 +406,8 @@ def _handle_early_failure(
     lock_acquired:     bool = False,
 ) -> dict:
     """
-    Handle a failure before Step 8's own cleanup runs. Mirrors the
-    Mover's _handle_early_failure — every terminal path must still
-    produce a LeaverAuditLog record.
+    Handle a failure before Step 8's own cleanup runs. Every terminal path must
+    still produce a LeaverAuditLog record.
     """
     audit_record["offboard_status"] = LeaverEventStatus.OFFBOARD_FAILED
     audit_record["warnings"].append(reason)
@@ -819,8 +432,8 @@ def main(req):
     """
     Azure Function HTTP trigger entry point.
 
-    Expects a JSON body with a canonical IdentityPayload where
-    action == "Leaver". start_date is used as the termination date.
+    Expects a JSON body with a canonical IdentityPayload where action ==
+    "Leaver". start_date is used as the termination date.
 
     Environment variables required:
         AZURE_STORAGE_CONNECTION_STRING
