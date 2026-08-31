@@ -23,7 +23,7 @@ import os
 from azure.data.tables import TableServiceClient
 
 from Ingestion.schema import IdentityPayload, EmploymentType, JmlAction
-from Provisioning.graph_client import build_graph_client, JmlGraphClient
+from Provisioning.graph_client import build_graph_client, JmlGraphClient, GraphClientError
 from Functions.Event_store.event_store import (
     get_events_table_client, generate_event_id,
     release_lock, update_event_status, EventStatus,
