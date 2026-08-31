@@ -18,6 +18,7 @@ composition, wait-hoisted into the orchestrator.
 """
 
 import json
+import logging
 import os
 
 from azure.data.tables import TableServiceClient
@@ -40,6 +41,8 @@ from Leaver.provisioning_phases import (
     finalize_removals,
 )
 
+
+logger = logging.getLogger(__name__)
 
 LEAVER_EVENT_LOG_TABLE = "LeaverEventLog"
 LEAVER_AUDIT_LOG_TABLE = "LeaverAuditLog"
