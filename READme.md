@@ -79,7 +79,7 @@ flowchart TD
     DIS --> REV["Revoke Sessions"]
     REV --> REM["Remove All Access Packages<br/>durable timer poll loop"]
     REM --> PIM["Terminate Active PIM Sessions"]
-    PIM --> SD["Soft Delete"]
+    PIM --> SD["Soft Delete<br/>immediate or deferred via durable timer"]
     SD --> VO["Verify Offboarding"]
     VO --> AUD["Audit"]
 ```
@@ -89,6 +89,8 @@ The Leaver does not attempt to calculate what the user *should* have. It removes
 This makes the workflow fail-safe: if a downstream cleanup operation fails, the account has already been prevented from authenticating.
 
 The Leaver runs as an Azure Durable Functions orchestration. Because offboarding is all-removal, every package removal is polled through durable timers rather than a blocking wait — so an offboarding whose removals take several minutes completes cleanly instead of being cut off at the gateway timeout. The disable and session revocation run first, inside the pre-removal stage, so the fail-safe holds regardless of how the rest of the run proceeds. There is one removal poll loop and no add-before-remove gate, which makes the Leaver orchestration simpler than the Mover's.
+
+Soft delete is subject to a configurable hold (`JML_LEAVER_SOFT_DELETE_HOLD_DAYS`). When the hold is zero the user is deleted immediately; when it is nonzero the deletion is deferred and completed later by a durable timer — the orchestration sleeps out the hold, then re-checks the account is still disabled before deleting, so a re-hire reusing the same UPN during the hold is not clobbered. Everything before the delete has already locked the account out and stripped its access, so the delay is safe.
 
 ---
 
@@ -197,6 +199,7 @@ The important part is that this is not only a policy simulation. The workflows e
 * Add-before-remove Mover sequencing
 * Disable-before-remove Leaver sequencing
 * Active PIM session termination during offboarding
+* Configurable soft-delete hold with durable-timer deferred deletion (re-hire-safe)
 * Managed and unmanaged Access Package detection
 * Retention-aware Mover processing
 * Leaver supersedes conflicting pending lifecycle events
@@ -257,6 +260,7 @@ The important part is that this is not only a policy simulation. The workflows e
 * Tenant-state verification
 * Per-event audit reporting
 * Durable Functions execution for the Joiner, Mover, and Leaver (timer-driven entitlement polling)
+* Deferred soft-delete completion via durable timer (re-hire-safe)
 * Synthetic identity ID for pre-provision governance (payload side)
 * BambooHR ingestion
 * CSV execution
@@ -272,7 +276,7 @@ The important part is that this is not only a policy simulation. The workflows e
 * BambooHR webhook ingestion
 * Event-store recovery/reclaim
 * Reconciliation pipeline
-* Resumable Leaver recovery
+* Resumable recovery for a partially failed Leaver (the deferred-delete path is built; broader mid-run resume is not)
 * Entra Entitlement Management approval workflow integration
 * Separation of Duties enforcement (platform-level, via Access Package incompatibilities — ADR-008)
 * Platform-enforced incompatible Access Package pre-flight check (ADR-011)

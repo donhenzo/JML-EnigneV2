@@ -416,7 +416,7 @@ flowchart TD
 
     S6{"Step 6<br/>Soft delete"}
     S6 -->|hold = 0| DEL["Delete user"]
-    S6 -->|hold > 0| DEFER["Deferred — logged"]
+    S6 -->|hold > 0| DEFER["Deferred — durable timer<br/>completes delete after hold"]
 
     DEL --> S7
     DEFER --> S7
@@ -499,7 +499,7 @@ This step requires `PrivilegedAssignmentSchedule.Read.AzureADGroup` (or equivale
 
 This step is gated by `JML_LEAVER_SOFT_DELETE_HOLD_DAYS`. When the hold is nonzero, the step logs a deferral and does not delete — everything before it has already locked the account out and stripped its access, so a delayed deletion is safe. When the hold is zero, deletion happens immediately.
 
-The hold is evaluated at pipeline execution time only. There is no background timer that returns later to finish the deletion. A deferred delete requires either a re-run of the pipeline (which `claim_event` will reject as a duplicate — see ADR-013 for the reclaim design that would allow this) or a Reconciliation event (ADR-012, not yet built) to complete.
+In the synchronous runtime the hold is evaluated at execution time only and a deferred delete is logged, not completed — finishing it would need a re-run (which `claim_event` rejects as a duplicate — see ADR-013) or a Reconciliation event (ADR-012, not yet built). In the durable runtime the deferred delete **is** completed: the orchestrator arms a timer for the hold and, on wake, runs a `deferred_delete` activity that re-checks the account is still disabled before deleting (§3.3.15). The synchronous path retains the log-only behaviour; the durable path is the one that finishes the deletion.
 
 ### 3.3.10 Step 7 — Post-Offboarding Verification
 
@@ -597,18 +597,19 @@ In the deployed Azure runtime the Leaver runs as an Azure Durable Functions orch
 The HTTP entry point (`leaver-durable`) is a thin starter that returns `202 Accepted` with a status URL and hands off to the orchestrator; the caller never blocks. The orchestrator drives the sequence and owns the removal wait as a durable timer:
 
 ```
-pre (claim → conflict supersede → concurrent check → fetch current state + lock → disable → revoke)
-  → submit removals → loop: check → all terminal? break : timer → finalize removals
-  → verify_finalize (terminate PIM → soft delete → verify → audit + release lock)
+pre (claim -> conflict supersede -> concurrent check -> fetch current state + lock -> disable -> revoke)
+  -> submit removals -> loop: check -> all terminal? break : timer -> finalize removals
+  -> verify_finalize (terminate PIM -> soft delete decision -> verify -> audit + release lock)
+  -> if soft delete deferred: timer(hold) -> deferred_delete
 ```
 
-Two properties matter here. First, **the disable-and-revoke fail-safe (ADR-015) runs inside the pre activity, before the removal loop** — so by the time any package removal begins, the account is already locked out and sessions revoked. A failure anywhere in the removal loop or after it still leaves a terminated identity that cannot authenticate; the fail-safe ordering §3.3.1 describes is preserved by putting disable and revoke in the same pre-removal activity, never after the submit loop. Second, **the removal poll is timer-driven** — where the synchronous path called `time.sleep` between polls, the orchestrator yields a durable timer that holds no compute, so an offboarding whose removals take past the HTTP gateway timeout runs to completion rather than being cut off. Because the Leaver is all-removal, even a small offboarding could exceed the gateway limit under a slow-delivering tenant; the durable model removes that ceiling entirely.
+Two properties matter in the main flow. First, **the disable-and-revoke fail-safe (ADR-015) runs inside the pre activity, before the removal loop** — so by the time any package removal begins, the account is already locked out and sessions revoked. A failure anywhere in the removal loop or after it still leaves a terminated identity that cannot authenticate; the fail-safe ordering §3.3.1 describes is preserved by putting disable and revoke in the same pre-removal activity, never after the submit loop. Second, **the removal poll is timer-driven** — where the synchronous path called `time.sleep` between polls, the orchestrator yields a durable timer that holds no compute, so an offboarding whose removals take past the HTTP gateway timeout runs to completion rather than being cut off. Because the Leaver is all-removal, even a small offboarding could exceed the gateway limit under a slow-delivering tenant; the durable model removes that ceiling entirely.
 
-The steps after the removal loop — PIM termination, soft delete, and verification — do not poll, so they fold into a single terminal activity (`verify_finalize`) rather than each taking their own; only the removal loop needs timer treatment. That terminal activity is also the single writer of the audit record, the `JmlEvents` terminal status, and the lock release, so every exit path produces a `LeaverAuditLog` record — the write that a synchronous run cut off by the gateway timeout could previously skip.
+The steps after the removal loop — PIM termination, the soft-delete decision, and verification — do not poll, so they fold into a single terminal activity (`verify_finalize`) rather than each taking their own; only the removal loop needs timer treatment. That terminal activity is also the single writer of the audit record, the `JmlEvents` terminal status, and the lock release, so every exit path produces a `LeaverAuditLog` record — the write that a synchronous run cut off by the gateway timeout could previously skip.
+
+**Deferred soft-delete completion.** The `hold > 0` case (§3.3.9) is completed by the durable model rather than only logged. `verify_finalize` writes the offboarding as `OFFBOARD_SUCCESS` immediately — the account is already disabled, sessions revoked, packages stripped, and the lock released — and reports that a delete was deferred. The orchestrator then arms `create_timer(now + hold)` and, on wake, calls a `deferred_delete` activity. That activity runs **lock-free** (the lock is long released) and applies a safety guard before deleting: it re-fetches the user and only deletes if the account is still disabled. If the user is already gone it is a no-op; if the account was re-enabled during the hold — a re-hire reusing the same UPN — the delete is **skipped and logged** rather than clobbering a legitimately re-created identity. On a successful deferred delete the activity does a single confined update to the existing `LeaverAuditLog` row (setting `user_deleted` true and appending a completion note), the one place the Leaver updates a record after its terminal write — deliberately scoped to the deferred-delete fields so the original offboarding evidence is preserved (§9). A test-only `JML_LEAVER_SOFT_DELETE_HOLD_SECONDS` override lets the timer be exercised in minutes; production uses the day-scale `JML_LEAVER_SOFT_DELETE_HOLD_DAYS`.
 
 State crosses every activity boundary as plain serializable data, the same discipline the Joiner and Mover orchestrations follow (§7.8, §3.2.13): the `PendingPackage` record tracking each removal moves between the submit, check, and finalize activities as a dictionary and reconstructs on the other side, and nothing holding a live client is passed across the boundary.
-
-The deferred soft-delete (§3.3.9) is a separate matter. The durable model now in place is exactly the mechanism a background timer to finish a `hold > 0` deletion would use, but that timer is not built — the durable Leaver replicates the synchronous behaviour precisely, logging the deferral without completing it later (§13).
 
 ---
 
@@ -924,7 +925,7 @@ Each stage is a Durable *activity*; the orchestrator is the conductor. State cro
 
 The provisioning phase functions are shared, not duplicated: the synchronous `provision_joiner` composes them with `time.sleep`, and the orchestrator composes the same functions with timers. This is why the synchronous Joiner path can be retained unchanged alongside the durable one — both call one implementation, differing only in who owns the waiting.
 
-The **Mover** was migrated the same way, and because it polls twice — an addition loop and a removal loop, gated by ADR-009 — it is the pipeline that most exercised the model; §3.2.13 describes its orchestration. The **Leaver** followed, with the simplest shape of the three: one removal poll loop and no gate, with the disable-and-revoke fail-safe run in the pre-removal activity so it holds regardless of how the removal loop proceeds; §3.3.15 describes it. One thing remains on this seam. The **deferred Leaver soft-delete** wants exactly the kind of background timer this orchestration model provides — a timer that returns later to finish work the first execution intentionally left pending — which it does not yet have: the durable Leaver replicates the synchronous defer-and-log behaviour precisely, and completing the deferred deletion later is a separate follow-on (§3.3.9, §11, §13).
+The **Mover** was migrated the same way, and because it polls twice — an addition loop and a removal loop, gated by ADR-009 — it is the pipeline that most exercised the model; §3.2.13 describes its orchestration. The **Leaver** followed, with the simplest shape of the three: one removal poll loop and no gate, with the disable-and-revoke fail-safe run in the pre-removal activity so it holds regardless of how the removal loop proceeds; §3.3.15 describes it. The Leaver's **deferred soft-delete** also uses this model: when the hold is nonzero the orchestrator arms a durable timer for the hold and, on wake, completes the deletion through a dedicated activity that re-checks the account is still disabled before deleting (§3.3.15). That closes the one piece of this seam that was previously only a plan.
 
 ### 7.9 Permissions
 
@@ -1187,13 +1188,11 @@ The engine is deployed to Azure and runs there today, on an Azure Functions app 
 
 - **Table Storage in Azure.** The engine's operational tables — `JmlEvents`, the hold queue, the Mover and Leaver event and audit logs, `RetentionRegistry` — live in the deployed storage account, partitioned as §6 and §8 describe.
 
-- **Durable Functions runtime for all three pipelines.** The Joiner's provisioning runs as a Durable orchestration: user creation, a user-propagation timer, package submission, a check-and-timer delivery-poll loop, then record-and-finalize (§7.8). The Mover runs the same way with two poll loops — additions then removals — and the ADR-009 add-before-remove gate as an orchestrator branch between them (§3.2.13). The Leaver runs a single removal poll loop with no gate, with disable-and-revoke in the pre-removal activity (§3.3.15). In every case the waits that were blocking `time.sleep` calls are orchestrator timers, so a long delivery or removal completes instead of hitting the gateway timeout.
+- **Durable Functions runtime for all three pipelines.** The Joiner's provisioning runs as a Durable orchestration: user creation, a user-propagation timer, package submission, a check-and-timer delivery-poll loop, then record-and-finalize (§7.8). The Mover runs the same way with two poll loops — additions then removals — and the ADR-009 add-before-remove gate as an orchestrator branch between them (§3.2.13). The Leaver runs a single removal poll loop with no gate, disable-and-revoke in the pre-removal activity, and a deferred-delete timer for a nonzero soft-delete hold (§3.3.15). In every case the waits that were blocking `time.sleep` calls are orchestrator timers, so a long delivery or removal completes instead of hitting the gateway timeout.
 
 ### 11.2 Remaining
 
 - **Managed Identity authentication.** Authentication is still `ClientSecretCredential` in both local and deployed environments. The planned change replaces it with a Managed Identity credential for all Graph and Azure Storage access; because the credential is constructed in one place per client, the swap is confined to those points (§7.1).
-
-- **Deferred soft-delete timer for the Leaver.** The Leaver runs as a Durable orchestration (§3.3.15), but its `hold > 0` soft-delete still only logs a deferral — nothing returns later to finish the deletion. The durable runtime now in place is exactly the mechanism a background timer would use; wiring that timer is a follow-on (§3.3.9, §13).
 
 - **Blob Storage for audit reports (immutability).** Joiner `DecisionReport` documents are written as local JSON today. The planned form writes them to a blob container under `reports/{year}/{month}/` with `overwrite=False` and an immutability/retention policy, so audit records cannot be altered or deleted — closing the gap §9.6 describes.
 
@@ -1226,6 +1225,7 @@ Honest architecture states what it does and what it does not. This section is th
 - Ingests from **BambooHR (live, with delta polling) and CSV**, deriving the action against live Entra state.
 - **Runs in Azure.** The engine is deployed on Azure Functions (Flex Consumption) and ships through a **GitHub Actions CI/CD pipeline authenticated by OIDC**.
 - **Runs all three pipelines as Durable Functions orchestrations** — timer-driven delivery polling, so a long assignment or removal completes rather than hitting the HTTP gateway timeout (§7.8). The Mover polls twice (additions then removals) with the ADR-009 gate between the loops (§3.2.13); the Leaver polls once with no gate and disable-revoke run first (§3.3.15).
+- **Completes a deferred Leaver soft-delete on its own.** When the soft-delete hold is nonzero, the durable Leaver arms a timer for the hold and completes the deletion on wake, re-checking the account is still disabled first so a re-hire during the hold is not clobbered (§3.3.15).
 - **Fans out to downstream targets automatically on package delivery.** Because access is delivered through Access Packages, assignment triggers Entra's own provisioning: SCIM to **AWS IAM Identity Center** for the packaged applications, and native **Microsoft 365 groups** for **Teams and SharePoint** access. The engine assigns the package; Entra delivers the fan-out. This is the built, proven downstream path (distinct from the engine-owned SCIM connector in §13).
 
 ### 12.2 What the Engine Does Not Do
@@ -1235,7 +1235,6 @@ Honest architecture states what it does and what it does not. This section is th
 - **Authenticate with Managed Identity.** Both environments still use Microsoft Graph client credentials; Managed Identity and Key Vault secrets are planned (§7.1, §11).
 - **Store audit records immutably.** Records are written once by the engine, but Joiner reports are local JSON and the audit tables are updatable — storage-enforced immutability (write-once blob with a retention policy) is planned (§9.6, §11).
 - **Recover a partially failed Leaver.** A partial offboarding is visible and contained but not yet recoverable without manual intervention — there is no hold-queue equivalent, and the reclaim (ADR-013) and reconciliation (ADR-012) paths that would resume it are unbuilt (§8.5).
-- **Complete a deferred soft-delete on its own.** The configurable hold has no background timer; finishing the delete needs a re-run or the reconciliation path. The Leaver now runs as a durable orchestration that could host exactly this kind of timer, but the deferred-delete timer itself is not yet built — the durable Leaver logs the deferral without completing it later (§3.3.15, §11).
 - **Write to the retention registry.** The engine reads `RetentionRegistry` but does not populate it — that requires an access request workflow. Entries are created manually today.
 - **Patch every attribute.** `usageLocation` (needs an ISO country code; the HR source sends city names) and `manager` (needs a separate Graph endpoint) are tracked but excluded from the write.
 - **Provision downstream through its own SCIM connector.** Downstream fan-out today is Entra-driven — package assignment triggers Entra's SCIM provisioning to AWS IAM Identity Center and its M365 group delivery to Teams/SharePoint (§12.1). What the engine does *not* do is own a SCIM connector of its own to arbitrary SaaS targets; that broader fan-out is future work (§13).
