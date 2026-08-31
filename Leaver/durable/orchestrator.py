@@ -16,6 +16,7 @@ Flow:
             (pre also disables + revokes, ADR-015)
     submit(remove) -> [check + timer]* -> finalize(remove)
     verify_finalize  (PIM terminate + soft delete + verify + audit + terminal)
+    -> if soft delete was deferred: timer(hold) -> deferred_delete
 """
 
 import azure.durable_functions as df
@@ -54,7 +55,21 @@ def orchestrator_function(context: df.DurableOrchestrationContext):
     state = yield from _run_poll_loop(context, state)
     state = yield context.call_activity("leaver_finalize_activity", state)
 
-    return (yield context.call_activity("leaver_verify_finalize_activity", state))
+    result = yield context.call_activity("leaver_verify_finalize_activity", state)
+
+    # Deferred-delete branch. The offboarding is already complete and its audit
+    # record written by verify_finalize; the account is locked out and stripped.
+    # If a soft-delete hold was configured, sleep it out on a durable timer (holds
+    # no compute, survives restarts), then complete the deletion. The deferred_delete
+    # activity re-checks the user is still disabled before deleting, so a re-hire
+    # during the hold is not clobbered.
+    if result.get("soft_delete_deferred") and result.get("hold_seconds", 0) > 0:
+        yield context.create_timer(
+            context.current_utc_datetime + _seconds(result["hold_seconds"])
+        )
+        result = yield context.call_activity("leaver_deferred_delete_activity", result)
+
+    return result
 
 
 build = df.Orchestrator.create(orchestrator_function)

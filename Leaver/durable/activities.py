@@ -302,9 +302,131 @@ def verify_finalize(state: dict) -> dict:
         failure_step="PostOffboardVerification" if final_status == "OFFBOARD_PARTIAL" else "",
     )
 
+    # Surface deferral info so the orchestrator can arm the deferred-delete timer.
+    # The lock is already released above and the terminal status already written —
+    # the deferred delete runs later, lock-free, and only updates the record.
+    from Leaver.stages import soft_delete_is_deferred, soft_delete_hold_seconds
+    deferred = soft_delete_is_deferred() and not user_deleted
+
     return {"final_status": final_status, "employee_id": employee_id,
-            "event_id": event_id,
+            "event_id": event_id, "user_id": user_id,
+            "payload_dict": state["payload_dict"],
+            "soft_delete_deferred": deferred,
+            "hold_seconds": soft_delete_hold_seconds() if deferred else 0,
             "summary": f"Leaver event completed with status {final_status}."}
+
+
+def deferred_delete(state: dict) -> dict:
+    """
+    Complete a deferred soft-delete after the orchestrator's hold timer fires.
+
+    Runs lock-free — the lock was already released and the terminal status
+    already written by verify_finalize, so the account is fully offboarded and
+    this only completes the delayed deletion and updates the audit record.
+
+    Safety guard: re-fetch the user and confirm it is still disabled before
+    deleting. Two edge cases the hold window can introduce, both handled here
+    rather than blindly deleting:
+      - The user was already deleted or is gone (get_user 404) — nothing to do.
+      - The user was re-enabled during the hold (a re-hire reusing the UPN) —
+        it is no longer the terminated identity, so the delete is skipped and
+        logged rather than nuking a legitimately re-created account.
+    """
+    payload = _payload_from_dict(state["payload_dict"])
+    employee_id = payload.employee_id
+    event_id = state["event_id"]
+    user_id = state["user_id"]
+
+    table_client = _table_client()
+    graph_client = _graph_client()
+
+    try:
+        current = graph_client.get_user(payload.upn)
+    except GraphClientError:
+        # 404 or fetch failure — treat as already gone. Nothing to delete.
+        _update_audit_deferred_delete(
+            table_client, employee_id, event_id,
+            user_deleted=False,
+            note="Deferred delete: user no longer resolvable at hold expiry — treated as already removed.",
+        )
+        logger.info("Deferred delete — user %s no longer resolvable, nothing to delete", payload.upn)
+        return {"final_status": "OFFBOARD_SUCCESS", "employee_id": employee_id,
+                "event_id": event_id, "summary": "Deferred delete: user already gone."}
+
+    if current.get("account_enabled") is not False:
+        # Re-enabled during the hold — a re-hire reusing the UPN. Do not delete.
+        _update_audit_deferred_delete(
+            table_client, employee_id, event_id,
+            user_deleted=False,
+            note="Deferred delete SKIPPED: account was re-enabled during the hold "
+                 "(likely a re-hire reusing the UPN). The terminated identity no "
+                 "longer matches; deletion abandoned.",
+        )
+        logger.warning(
+            "Deferred delete SKIPPED — %s is re-enabled at hold expiry (re-hire?). Not deleting.",
+            payload.upn,
+        )
+        return {"final_status": "OFFBOARD_SUCCESS", "employee_id": employee_id,
+                "event_id": event_id, "summary": "Deferred delete skipped — account re-enabled."}
+
+    try:
+        graph_client.delete_user(user_id)
+        _update_audit_deferred_delete(
+            table_client, employee_id, event_id,
+            user_deleted=True,
+            note="Deferred delete completed after hold expiry.",
+        )
+        logger.info("Deferred delete completed — user %s removed after hold", payload.upn)
+        return {"final_status": "OFFBOARD_SUCCESS", "employee_id": employee_id,
+                "event_id": event_id, "summary": "Deferred delete completed."}
+    except GraphClientError as e:
+        _update_audit_deferred_delete(
+            table_client, employee_id, event_id,
+            user_deleted=False,
+            note=f"Deferred delete failed at hold expiry: {e}",
+        )
+        logger.warning("Deferred delete failed — user %s: %s", payload.upn, e)
+        return {"final_status": "OFFBOARD_PARTIAL", "employee_id": employee_id,
+                "event_id": event_id, "summary": f"Deferred delete failed: {e}"}
+
+
+def _update_audit_deferred_delete(table_client, employee_id, event_id, user_deleted, note):
+    """
+    Update the existing LeaverAuditLog row to record the deferred-delete outcome.
+
+    This is a deliberate second write to the same row — the only place the Leaver
+    updates a record after its terminal write. It is confined to the deferred-delete
+    fields (user_deleted, a warning note, and the verification's user_deleted flag)
+    so the original offboarding evidence is preserved, not overwritten.
+    """
+    try:
+        client = table_client.get_table_client(LEAVER_AUDIT_LOG_TABLE)
+        existing = client.get_entity(partition_key=employee_id, row_key=event_id)
+
+        warnings = json.loads(existing.get("warnings", "[]"))
+        warnings.append(note)
+        existing["warnings"] = json.dumps(warnings)
+
+        verification = json.loads(existing.get("post_offboard_verification", "{}"))
+        verification["user_deleted"] = user_deleted
+        verification["soft_delete_deferred"] = False if user_deleted else verification.get("soft_delete_deferred", True)
+        existing["post_offboard_verification"] = json.dumps(verification)
+
+        if user_deleted:
+            actions = json.loads(existing.get("actions_taken", "[]"))
+            actions.append({
+                "action": "SoftDelete",
+                "detail": "User moved to deleted-users container (deferred)",
+                "succeeded": True,
+            })
+            existing["actions_taken"] = json.dumps(actions)
+
+        client.update_entity(existing)
+    except Exception as e:
+        logger.error(
+            "Deferred-delete audit update failed — employee=%s, event=%s, error=%s",
+            employee_id, event_id, str(e),
+        )
 
 
 def _early_fail(table_client, jml_events_client, employee_id, event_id,

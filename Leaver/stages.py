@@ -56,6 +56,25 @@ STALE_LOCK_MINUTES     = 10
 SOFT_DELETE_HOLD_DAYS = int(os.environ.get("JML_LEAVER_SOFT_DELETE_HOLD_DAYS", "0"))
 
 
+def soft_delete_hold_seconds() -> int:
+    """
+    Resolve the soft-delete hold as seconds. JML_LEAVER_SOFT_DELETE_HOLD_SECONDS
+    is a test override — when set (nonzero) it wins, so the durable deferred-delete
+    timer can be proven in minutes instead of days. Otherwise the hold is
+    JML_LEAVER_SOFT_DELETE_HOLD_DAYS converted to seconds. Zero from both means
+    immediate deletion.
+    """
+    seconds_override = int(os.environ.get("JML_LEAVER_SOFT_DELETE_HOLD_SECONDS", "0"))
+    if seconds_override > 0:
+        return seconds_override
+    return SOFT_DELETE_HOLD_DAYS * 86400
+
+
+def soft_delete_is_deferred() -> bool:
+    """True if any hold is configured (days or the seconds test override)."""
+    return soft_delete_hold_seconds() > 0
+
+
 # Helpers moved from leaver_http — live here so a Durable activity can reach
 # them without importing the trigger module.
 
@@ -435,24 +454,28 @@ def stage_soft_delete(
     Step 6 — soft delete, subject to the configurable hold.
 
     hold == 0 deletes now (Graph DELETE → deleted-users container, recoverable
-    30 days). hold > 0 defers and logs, exactly as the pre-refactor pipeline —
-    everything before this step has already locked the account out and stripped
-    access, so a delayed deletion is safe. The deferred-delete durable timer is
-    a separate follow-on and is intentionally NOT implemented here; this stage
-    replicates current behaviour.
+    30 days). hold > 0 defers and logs — everything before this step has already
+    locked the account out and stripped access, so a delayed deletion is safe.
 
-    Emits user_deleted (bool) in data so the driver's verification and final
-    status can read it.
+    In the durable runtime the orchestrator arms a timer for the hold and fires
+    the deferred_delete activity when it wakes (§3.3.15), so a deferred delete is
+    actually completed later rather than only logged. In the synchronous runtime
+    there is no such timer — the deferral is logged and a re-run or reconciliation
+    completes it. This stage only decides defer-vs-delete-now; it does not own the
+    timer either way.
+
+    Emits user_deleted (bool) in data so verification and final status can read it.
     """
-    if SOFT_DELETE_HOLD_DAYS > 0:
-        logger.info("  ⊘ soft delete deferred %d day(s) per policy", SOFT_DELETE_HOLD_DAYS)
+    if soft_delete_is_deferred():
+        hold_seconds = soft_delete_hold_seconds()
+        logger.info("  ⊘ soft delete deferred %d second(s) per policy", hold_seconds)
         return StageResult(
             ok=True,
             outcome=StageOutcome.PROCEED,
             data={"user_deleted": False},
             report_warnings=[
-                f"Soft delete deferred {SOFT_DELETE_HOLD_DAYS} day(s) per "
-                f"JML_LEAVER_SOFT_DELETE_HOLD_DAYS policy — not yet deleted."
+                f"Soft delete deferred {SOFT_DELETE_HOLD_DAYS} day(s) "
+                f"({hold_seconds}s) per policy — deferred deletion scheduled."
             ],
         )
 
@@ -530,7 +553,7 @@ def stage_verify(
         "account_disabled_confirmed": account_disabled_confirmed,
         "packages_cleared":           packages_cleared,
         "user_deleted":               user_deleted,
-        "soft_delete_deferred":       SOFT_DELETE_HOLD_DAYS > 0,
+        "soft_delete_deferred":       soft_delete_is_deferred(),
     }
 
     return StageResult(

@@ -34,10 +34,9 @@ LEAVER_EVENT_LOG_TABLE = "LeaverEventLog"
 
 # The two orphaned runs — (employee_id, event_id from the 504'd runs).
 ORPHANS = [
-    ("E900",          "1eb457d83d7564b3d1ef4b0c593ae6a6"),
-    # TIMER_TEST_01's event_id was hash("TIMER_TEST_01|Leaver|2026-08-28").
-    # Fill in the real RowKey from its JmlEvents row before running that one.
-    # ("TIMER_TEST_01", "<event_id_from_its_jmlevents_row>"),
+    ("E900",          "1eb457d83d7564b3d1ef4b0c593ae6a6"),  # start_date 2026-08-29
+    ("E901",          "16902820ff48eb81528cd060e1ef18ac"),  # start_date 2026-09-01
+    ("TIMER_TEST_01", "f9f7292468de0e026cc93fbfbce1f36f"),  # start_date 2026-08-28 (guess — script no-ops if absent)
 ]
 
 
