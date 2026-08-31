@@ -1,0 +1,1 @@
+from Leaver.durable.activities import deferred_delete as main
