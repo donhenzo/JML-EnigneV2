@@ -1,0 +1,564 @@
+{
+  "1b7ecaab-83fd-4069-a789-2eeca4692294": {
+    "catalog_name": "IT-Dept",
+    "packages": [
+      {
+        "package_id": "eeebad6f-bd3d-4c9c-bf45-f223318a578b",
+        "package_name": "Security Operations",
+        "assignment_policies": [
+          {
+            "policy_id": "1823aecf-9991-4ade-901b-8c96dd1faa6e",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "aa2da4a1-70e4-43e3-903a-7c98193d57b9",
+            "display_name": "SG_Security_LogAdmin",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      },
+      {
+        "package_id": "e643af81-b566-48da-9508-400e7d35e145",
+        "package_name": "Cloud Platform (Prod)",
+        "assignment_policies": [
+          {
+            "policy_id": "f03b32c6-30e2-4b7c-94e3-d14e7f82d71f",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "46d1b79e-c7ef-48b2-bfcf-77612af69e85",
+            "display_name": "SG_Azure_Owner_Prod",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      },
+      {
+        "package_id": "1abf25a3-812b-4655-991a-9de848783dd3",
+        "package_name": "Access Governance",
+        "assignment_policies": [
+          {
+            "policy_id": "dd0b04fd-1b61-457c-b8bc-ad2c35ca392b",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "f4fc76ad-357f-4eec-87df-c542131f3d90",
+            "display_name": "SG_IAM_AccessReviewer",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      },
+      {
+        "package_id": "30e8955c-4227-4ca6-a6ca-7ee441252a2c",
+        "package_name": "Identity Administration",
+        "assignment_policies": [
+          {
+            "policy_id": "b546ce7c-ce44-41e6-8dce-87786a4578f8",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "cf3c41db-bc1a-4f55-9899-964fd5a09ee9",
+            "display_name": "IT-Department",
+            "role": "Member"
+          },
+          {
+            "group_id": "a95ead07-7a3f-403b-8950-c7b4d5e050a3",
+            "display_name": "SG_IAM_AccessAdministrator",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      },
+      {
+        "package_id": "fab74505-600c-4f63-a128-fe19f1805e78",
+        "package_name": "IT",
+        "assignment_policies": [
+          {
+            "policy_id": "391a6f4c-f673-4480-8469-fddfb72d689a",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "95222bce-ccee-42f8-948b-08dae9e88f2f",
+            "display_name": "GRP_GitHub_Enterprise",
+            "role": "Member"
+          },
+          {
+            "group_id": "cf3c41db-bc1a-4f55-9899-964fd5a09ee9",
+            "display_name": "IT-Department",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      }
+    ]
+  },
+  "240734a9-7adf-47b4-929c-623e7fda0cf1": {
+    "catalog_name": "HR",
+    "packages": [
+      {
+        "package_id": "f1aba94c-7c6c-42ae-8d3b-af56f3e4bd7f",
+        "package_name": "People Operations",
+        "assignment_policies": [
+          {
+            "policy_id": "ee3d5d90-5098-4641-a246-e13cb0da95f5",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "9190994f-b898-4fc3-9694-376ca230cf03",
+            "display_name": "SG_HR_DataExport",
+            "role": "Member"
+          },
+          {
+            "group_id": "b0a9e50f-466a-484e-aff7-9da5bc368312",
+            "display_name": "SG_HRIS_EmployeeMasterData",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      },
+      {
+        "package_id": "7d9805c7-357f-4d17-bc94-0cd901252df5",
+        "package_name": "HR_Core",
+        "assignment_policies": [
+          {
+            "policy_id": "0b6f624b-1f79-41c2-a082-7b552539a514",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "35edfa06-4f41-46a6-990b-fd58e3ed91ed",
+            "display_name": "GRP_DocuSign_Users",
+            "role": "Member"
+          },
+          {
+            "group_id": "7027bf77-e809-431b-a876-32430d832948",
+            "display_name": "GRP_Workday_Users",
+            "role": "Member"
+          },
+          {
+            "group_id": "6f27dd38-3648-4cd3-af11-f8d4433262c9",
+            "display_name": "GRP_HR_Users",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      }
+    ]
+  },
+  "f817a9fe-d602-48b1-aa05-de68966c15c9": {
+    "catalog_name": "Payroll",
+    "packages": [
+      {
+        "package_id": "ab140c4d-3082-4fa8-9b8e-15a56a511347",
+        "package_name": "Payroll_Operations",
+        "assignment_policies": [
+          {
+            "policy_id": "0d7a637a-0a17-407a-a848-9f31d64cfa18",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "8ca7c085-684c-4cb4-b77c-89fe3396bc97",
+            "display_name": "SG_Payroll_Administrator",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      }
+    ]
+  },
+  "0d6b0532-0114-46fd-af52-efaafb9cc10b": {
+    "catalog_name": "Procurement",
+    "packages": [
+      {
+        "package_id": "3c62a411-2fc6-4990-a84c-f3495d428c92",
+        "package_name": "Approvals",
+        "assignment_policies": [
+          {
+            "policy_id": "eb550b8e-1c7c-4a74-8375-e8c491026976",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "40f086db-6d11-4ae2-a8d0-ffe8c113c408",
+            "display_name": "SG_Procure_POApprove",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      },
+      {
+        "package_id": "bb7ab13a-fd31-4612-9b39-d1770b5767b8",
+        "package_name": "Operations",
+        "assignment_policies": [
+          {
+            "policy_id": "4c1ded2b-d0e3-41fe-a25f-de568a868818",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "44be5673-a535-4d6d-a6ec-9106688822a5",
+            "display_name": "SG_Procure_GoodsReceipt",
+            "role": "Member"
+          },
+          {
+            "group_id": "75a4d06c-f62d-4b5a-b8ca-59a5b035482e",
+            "display_name": "SG_Procure_RequisitionCreate",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      }
+    ]
+  },
+  "b46dc0fc-de90-4b33-a210-f5eb45291b72": {
+    "catalog_name": "Finance catalog",
+    "packages": [
+      {
+        "package_id": "7ebf6d75-a25a-458a-9184-50c3c037739b",
+        "package_name": "Internal Audit",
+        "assignment_policies": [
+          {
+            "policy_id": "bf55ae72-684e-4a52-b009-16814564c435",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "38b3d838-9fd4-4fb2-a111-9208c52e1f19",
+            "display_name": "SG_Finance_Auditor",
+            "role": "Member"
+          },
+          {
+            "group_id": "d4f83747-b549-4ff6-82e2-707a5dc22ea4",
+            "display_name": "SG_Finance_Core",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      },
+      {
+        "package_id": "f1153899-70b0-4878-8333-36125ad498de",
+        "package_name": "Vendor Master Data",
+        "assignment_policies": [
+          {
+            "policy_id": "b48b9a9d-d92c-4d9d-ae19-d41e502d2fd0",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "024066e1-5336-44a7-af19-e06edb0a8e46",
+            "display_name": "SG_ERP_VendorMaintenance",
+            "role": "Member"
+          },
+          {
+            "group_id": "d4f83747-b549-4ff6-82e2-707a5dc22ea4",
+            "display_name": "SG_Finance_Core",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      },
+      {
+        "package_id": "a28b873f-cbc6-4bdf-ac13-15304180e405",
+        "package_name": "Treasury & Payments",
+        "assignment_policies": [
+          {
+            "policy_id": "7ac98515-4d1f-41f7-8be2-626e6892c27a",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "e399aec7-59f6-41c5-8391-2aedad7a125c",
+            "display_name": "SG_ERP_PaymentRun",
+            "role": "Member"
+          },
+          {
+            "group_id": "d4f83747-b549-4ff6-82e2-707a5dc22ea4",
+            "display_name": "SG_Finance_Core",
+            "role": "Member"
+          },
+          {
+            "group_id": "9400f410-e800-4936-ad1b-aa9ec4320907",
+            "display_name": "SG_ERP_BankReconciliation",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      },
+      {
+        "package_id": "d392ce9d-f43e-4d95-bdb9-4817939e3869",
+        "package_name": "Financial Accountant",
+        "assignment_policies": [
+          {
+            "policy_id": "003306e4-9753-4810-86bc-3582f098adac",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "13c4a49a-484f-4ed6-98ca-4059463a3bb6",
+            "display_name": "SG_ERP_GLJournalPost",
+            "role": "Member"
+          },
+          {
+            "group_id": "d0f977ab-c825-41f9-b554-3e51307c1966",
+            "display_name": "SG_ERP_APInvoiceEntry",
+            "role": "Member"
+          },
+          {
+            "group_id": "d4f83747-b549-4ff6-82e2-707a5dc22ea4",
+            "display_name": "SG_Finance_Core",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      },
+      {
+        "package_id": "ccc4aa85-48b9-409b-bd6d-6777a29e9eb8",
+        "package_name": "Finance Manager",
+        "assignment_policies": [
+          {
+            "policy_id": "0756f9f1-1992-49ee-ac58-1a08877a0910",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "15a3f8de-ac81-4305-b20b-133f7cb7c8a7",
+            "display_name": "SG_Finance_BudgetApproval_PIM",
+            "role": "Member"
+          },
+          {
+            "group_id": "d4f83747-b549-4ff6-82e2-707a5dc22ea4",
+            "display_name": "SG_Finance_Core",
+            "role": "Member"
+          },
+          {
+            "group_id": "b11c8c70-5971-4768-a8fd-1777abc5b60a",
+            "display_name": "SG_Finance_PowerBI",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      },
+      {
+        "package_id": "d92d7e03-8487-4103-ac3b-e38e625f3c1a",
+        "package_name": "finance analysts",
+        "assignment_policies": [
+          {
+            "policy_id": "44935bfd-f2e8-4d8b-b286-ea1826483e77",
+            "display_name": "Initial Policy"
+          },
+          {
+            "policy_id": "f70685c6-6438-48c0-8331-11f9ecfa7e8b",
+            "display_name": "contractor policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "d4f83747-b549-4ff6-82e2-707a5dc22ea4",
+            "display_name": "SG_Finance_Core",
+            "role": "Member"
+          },
+          {
+            "group_id": "b11c8c70-5971-4768-a8fd-1777abc5b60a",
+            "display_name": "SG_Finance_PowerBI",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      }
+    ]
+  },
+  "4d48e1f6-f2ff-4903-bb81-d3799b1560bd": {
+    "catalog_name": "Sales",
+    "packages": [
+      {
+        "package_id": "44371b1c-49d4-49d4-b383-db52f7ab5001",
+        "package_name": "Sales_Core",
+        "assignment_policies": [
+          {
+            "policy_id": "38ec9fca-d687-485a-b71d-a264caa9a31e",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "de9ea587-64bd-4eca-8a4c-aec4c319d462",
+            "display_name": "GRP_Salesforce_Users",
+            "role": "Member"
+          },
+          {
+            "group_id": "a7d7b28c-6dc3-4cda-8649-266d8ba78278",
+            "display_name": "Sales-Department",
+            "role": "Member"
+          },
+          {
+            "group_id": "6758ebab-b07c-4fbe-a93f-06a6849083e7",
+            "display_name": "GRP_Sales_Users",
+            "role": "Member"
+          },
+          {
+            "group_id": "5db837c1-891a-4fcd-999b-fdd056b75928",
+            "display_name": "GRP_PowerBI_Viewers",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      }
+    ]
+  },
+  "bd20cdfc-72e7-45ae-a671-233147f7d85f": {
+    "catalog_name": "General",
+    "packages": [
+      {
+        "package_id": "ee3711b4-7f92-4694-a24f-baa55aae7c52",
+        "package_name": "SWE_Core",
+        "assignment_policies": [
+          {
+            "policy_id": "5a006188-cca4-4e0f-85ed-505a9534f85e",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "384adcd5-02f2-4b37-8e44-6ae1df2b4b79",
+            "display_name": "GRP_Jira_Users",
+            "role": "Member"
+          },
+          {
+            "group_id": "95222bce-ccee-42f8-948b-08dae9e88f2f",
+            "display_name": "GRP_GitHub_Enterprise",
+            "role": "Member"
+          },
+          {
+            "group_id": "156d3a05-5c93-451b-95f2-60f9bd108c4d",
+            "display_name": "GRP_SoftwareEngineering_Users",
+            "role": "Member"
+          },
+          {
+            "group_id": "68bbf962-ec0f-47d8-adb7-982293fa757f",
+            "display_name": "GRP_Confluence_Users",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      }
+    ]
+  },
+  "95b64b23-9b95-48fa-9cfa-1fa96b8f5aa0": {
+    "catalog_name": "Coporate",
+    "packages": [
+      {
+        "package_id": "4d3e5b5c-57c6-4b33-a4da-3be91dabbbd0",
+        "package_name": "AP_Corporate_Standard",
+        "assignment_policies": [
+          {
+            "policy_id": "0ac2a5ea-fa99-4caf-bbca-0df5c5605b61",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "fa666ef3-2896-4417-afeb-8c0a508d7028",
+            "display_name": "GRP_Company_Email",
+            "role": "Member"
+          },
+          {
+            "group_id": "23a26ce3-7c30-429f-af98-05c7f76fe973",
+            "display_name": "GRP_All_Staff",
+            "role": "Member"
+          },
+          {
+            "group_id": "b35ef542-c600-484c-a13a-083d62dce837",
+            "display_name": "GRP_MFA_Required",
+            "role": "Member"
+          },
+          {
+            "group_id": "659bcb41-1888-4814-9c5e-c6c3f60ed240",
+            "display_name": "GRP_VPN_Access",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      }
+    ]
+  },
+  "34de46e5-be11-412e-b1ff-a1fc7ed07fcc": {
+    "catalog_name": "Cybersecurity",
+    "packages": [
+      {
+        "package_id": "9c2f1f46-8dea-49f6-9aed-15b5c662685d",
+        "package_name": "AP_Cybersecurity_Cyber",
+        "assignment_policies": [
+          {
+            "policy_id": "2a2c9f9f-a8d9-40f7-99f6-9651879f51a2",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "4f6184c6-43c5-44e7-843e-1f3dd589ab59",
+            "display_name": "GRP_Cyber_SOC",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      },
+      {
+        "package_id": "21b3d7ce-df56-40a0-b68e-a208facfe4d0",
+        "package_name": "AP_Cybersecurity_Employe",
+        "assignment_policies": [
+          {
+            "policy_id": "cd58f95e-ba47-4df5-99de-4f6a56b33bbf",
+            "display_name": "Initial Policy"
+          }
+        ],
+        "groups": [
+          {
+            "group_id": "384adcd5-02f2-4b37-8e44-6ae1df2b4b79",
+            "display_name": "GRP_Jira_Users",
+            "role": "Member"
+          },
+          {
+            "group_id": "95222bce-ccee-42f8-948b-08dae9e88f2f",
+            "display_name": "GRP_GitHub_Enterprise",
+            "role": "Member"
+          },
+          {
+            "group_id": "68bbf962-ec0f-47d8-adb7-982293fa757f",
+            "display_name": "GRP_Confluence_Users",
+            "role": "Member"
+          },
+          {
+            "group_id": "273985ee-14d7-4ae5-9101-9769e7db94c3",
+            "display_name": "GRP_Cybersecurity_Users",
+            "role": "Member"
+          }
+        ],
+        "other_resources": []
+      }
+    ]
+  }
+}

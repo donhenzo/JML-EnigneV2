@@ -41,7 +41,8 @@ from Functions.Event_store.conflict_queue import (
 from Mapping.mapping_loader import load_mapping_rules
 from Mapping.mapping_resolver import resolve_entitlements
 
-from Validation.validation_gate import pre_provision_validate, post_provision_validate
+from Validation.validation_gate import post_provision_validate
+from governance.preprovision import run_preprovision
 from datetime import date
 from Audit.models import DecisionReport, ReportEvent
 from Mapping.mapping_resolver import (
@@ -349,38 +350,36 @@ def stage_pre_validate(
 ) -> StageResult:
     """
     Pre-provision governance gate — evaluate the canonical payload before any
-    Entra object exists. Wraps pre_provision_validate (which threads the
-    synthetic identity ID into the PreProvision call, ADR-017).
+    Entra object exists. Runs in-process (ADR-019): attribute-only checks on the
+    payload, zero Graph calls. Replaces the former HTTP call to the PowerShell
+    validation engine; the stage contract is unchanged.
 
     Outcomes:
-      PROCEED — validation passed; warnings ride back for the driver to record.
+      PROCEED — validation passed.
       HELD    — validation failed; the driver routes the record to the hold
                 queue using hold_reasons, and marks the event Failed with
                 failure_step=PreProvisionValidation.
-
-    No client injection needed — the validation gate builds its own HTTP call
-    (or returns the skipped result when JML_SKIP_VALIDATION_ENGINE is set).
     """
-    result = pre_provision_validate(payload)
+    result = run_preprovision(payload.to_dict())
 
     if not result.passed:
+        hold_reasons = [f"[{finding.rule_id}] {finding.details}" for finding in result.failures]
         logger.warning(
             "Pre-provision validation failed — employee=%s, failures=%s",
-            payload.employee_id, result.failure_summary(),
+            payload.employee_id, hold_reasons,
         )
         return StageResult(
             ok=False,
             outcome=StageOutcome.HELD,
             data={"event_id": event_id, "failure_step": "PreProvisionValidation"},
-            hold_reasons=result.failure_summary(),
-            summary=f"Pre-provision validation failed: {result.failure_summary()}",
+            hold_reasons=hold_reasons,
+            summary=f"Pre-provision validation failed: {hold_reasons}",
         )
 
     return StageResult(
         ok=True,
         outcome=StageOutcome.PROCEED,
         data={"event_id": event_id},
-        report_warnings=result.warning_summary(),
         summary="Pre-provision validation passed",
     )
 

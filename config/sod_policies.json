@@ -1,71 +1,138 @@
 {
-  "version": "1.0.0",
+  "version": "2.0.0",
+  "description": "Group-anchored SoD conflict catalogue. Keyed on real Entra group object IDs delivered by access packages. Detective layer (scanner + in-engine PostProvision) reads memberOf and intersects against these pairs. Block pairs are ALSO enforced preventively at the platform via package incompatibility; Warn pairs are detective-only (Entra has no platform Warn).",
   "policies": [
     {
       "id": "SOD-001",
-      "name": "Payment Approver / Payment Processor",
-      "description": "The same user cannot both process and approve payments. This is the classic payment fraud scenario — a single identity controlling both sides of a financial transaction removes all maker-checker separation.",
+      "name": "Vendor Maintenance / Payment Run",
+      "description": "Create a vendor with attacker-controlled bank details and then execute payment to it. The classic ERP payment-fraud path.",
       "risk_rating": "Critical",
       "mode": "AnyToAny",
-      "set_a": ["8ba2677b-0316-4ec2-a8d5-03359f36b433"],
-      "set_b": ["02d7e0dd-df9a-4b9f-aa97-492d8bccd480"],
+      "set_a": ["024066e1-5336-44a7-af19-e06edb0a8e46"],
+      "set_b": ["e399aec7-59f6-41c5-8391-2aedad7a125c"],
       "action": "Block",
-      "compensating_control": "Requires CISO and Finance Director sign-off. No exception permitted in regulated environments without documented board-level approval and quarterly access certification."
+      "compensating_control": "CISO + Finance Director sign-off. No exception in regulated environments without board-level approval and quarterly certification."
     },
     {
       "id": "SOD-002",
-      "name": "IT User Provisioner / IT Access Approver",
-      "description": "The same user cannot both provision user accounts and approve the access those accounts receive. This eliminates maker-checker separation in the identity lifecycle — a single identity could create accounts and self-approve elevated access.",
+      "name": "Vendor Maintenance / AP Invoice Entry",
+      "description": "Set up a vendor and raise invoices against it — self-dealing on both master data and the payable.",
       "risk_rating": "Critical",
       "mode": "AnyToAny",
-      "set_a": ["1668923f-57f6-4fc0-8ba0-bc698b3e17e8"],
-      "set_b": ["9795b324-f724-4ba7-b01f-9735587fbca3"],
+      "set_a": ["024066e1-5336-44a7-af19-e06edb0a8e46"],
+      "set_b": ["d0f977ab-c825-41f9-b554-3e51307c1966"],
       "action": "Block",
-      "compensating_control": "Requires CISO sign-off. Role must be split across two distinct identities. No single-person exception permitted without documented compensating control reviewed quarterly."
+      "compensating_control": "CISO + Finance Director sign-off. Split across two identities."
     },
     {
       "id": "SOD-003",
-      "name": "Payment Processor / Finance Auditor",
-      "description": "A user who can execute payment transactions cannot also audit their own activity. Audit independence is destroyed when the same identity can both initiate transactions and validate them during audit activities.",
-      "risk_rating": "High",
+      "name": "AP Invoice Entry / Payment Run",
+      "description": "Enter an invoice and release its payment with no second pair of eyes on cash out.",
+      "risk_rating": "Critical",
       "mode": "AnyToAny",
-      "set_a": ["02d7e0dd-df9a-4b9f-aa97-492d8bccd480"],
-      "set_b": ["c3b520b3-2e66-452c-aa37-ef813ad5b16d"],
-      "action": "Warn",
-      "compensating_control": "Flag for governance review. Require written justification from Finance Director. Compensating control: enhanced transaction monitoring and independent quarterly audit review of all transactions processed by this identity."
+      "set_a": ["d0f977ab-c825-41f9-b554-3e51307c1966"],
+      "set_b": ["e399aec7-59f6-41c5-8391-2aedad7a125c"],
+      "action": "Block",
+      "compensating_control": "Finance Director sign-off. Maker-checker must be enforced across two identities."
     },
     {
       "id": "SOD-004",
-      "name": "Payment Approver / Finance Auditor",
-      "description": "An auditor who also approves financial transactions loses independence. In regulated environments this constitutes a control failure — the identity responsible for validating financial accuracy cannot also be approving the transactions it reviews.",
+      "name": "GL Journal Post / Finance Auditor",
+      "description": "Post journal entries and then audit your own entries — audit independence destroyed.",
       "risk_rating": "High",
       "mode": "AnyToAny",
-      "set_a": ["8ba2677b-0316-4ec2-a8d5-03359f36b433"],
-      "set_b": ["c3b520b3-2e66-452c-aa37-ef813ad5b16d"],
+      "set_a": ["13c4a49a-484f-4ed6-98ca-4059463a3bb6"],
+      "set_b": ["38b3d838-9fd4-4fb2-a111-9208c52e1f19"],
       "action": "Warn",
-      "compensating_control": "Flag for governance review. Requires Finance Director and external audit liaison sign-off. This combination is typically disallowed in SOX and GDPR-regulated environments."
+      "compensating_control": "Governance review. In SOX scope treat as Block. Independent review of all entries posted by this identity."
     },
     {
       "id": "SOD-005",
-      "name": "Journal Poster / Finance Auditor",
-      "description": "A user who can post accounting journal entries cannot also audit and validate those entries. This allows an identity to manipulate accounting records and then certify them as accurate during audit activities.",
+      "name": "GL Journal Post / Bank Reconciliation",
+      "description": "Post a journal and reconcile the account it hits, concealing the discrepancy.",
       "risk_rating": "High",
       "mode": "AnyToAny",
-      "set_a": ["12572599-6760-4433-963e-234461095ccc"],
-      "set_b": ["c3b520b3-2e66-452c-aa37-ef813ad5b16d"],
+      "set_a": ["13c4a49a-484f-4ed6-98ca-4059463a3bb6"],
+      "set_b": ["9400f410-e800-4936-ad1b-aa9ec4320907"],
       "action": "Warn",
-      "compensating_control": "Flag for governance review. Compensating control: all journal entries posted by this identity must be independently reviewed by a second Finance team member before audit sign-off. Requires Finance Director approval."
+      "compensating_control": "Governance review. Independent reconciliation review."
     },
     {
       "id": "SOD-006",
-      "name": "HR Salary Admin / HR Data Export",
-      "description": "A user who can administer salary and payroll data cannot also bulk export sensitive employee information. This combination presents a direct insider data exfiltration risk — a single identity can access and extract the organisation's most sensitive HR records.",
+      "name": "Requisition Create / PO Approve",
+      "description": "Raise a purchase requisition and approve the resulting PO yourself.",
       "risk_rating": "High",
       "mode": "AnyToAny",
-      "set_a": ["cb01abd7-b56d-4bb5-8d2b-e41ca740f7e7"],
-      "set_b": ["b5f4b30d-952e-4a86-ba4d-32234f00c814"],
+      "set_a": ["75a4d06c-f62d-4b5a-b8ca-59a5b035482e"],
+      "set_b": ["40f086db-6d11-4ae2-a8d0-ffe8c113c408"],
+      "action": "Block",
+      "compensating_control": "Procurement Director sign-off. Approver must differ from requester."
+    },
+    {
+      "id": "SOD-007",
+      "name": "PO Approve / Goods Receipt",
+      "description": "Approve a purchase order and confirm receipt of the goods — approve and self-confirm delivery.",
+      "risk_rating": "High",
+      "mode": "AnyToAny",
+      "set_a": ["40f086db-6d11-4ae2-a8d0-ffe8c113c408"],
+      "set_b": ["44be5673-a535-4d6d-a6ec-9106688822a5"],
       "action": "Warn",
-      "compensating_control": "Requires HR Director and DPO sign-off. Compensating control: all data export activity by this identity must be logged, monitored via DLP policy, and reviewed monthly. Export volumes must be reported to the DPO quarterly."
+      "compensating_control": "Governance review. Independent goods-receipt confirmation."
+    },
+    {
+      "id": "SOD-008",
+      "name": "Payroll Administrator / HRIS Employee Master Data",
+      "description": "Change an employee's bank details in HR and run the pay that sends money there — ghost-employee / redirected-pay fraud.",
+      "risk_rating": "Critical",
+      "mode": "AnyToAny",
+      "set_a": ["8ca7c085-684c-4cb4-b77c-89fe3396bc97"],
+      "set_b": ["b0a9e50f-466a-484e-aff7-9da5bc368312"],
+      "action": "Block",
+      "compensating_control": "HR Director + Payroll Manager sign-off. Master-data edits and pay runs on separate identities."
+    },
+    {
+      "id": "SOD-009",
+      "name": "Payroll Administrator / HR Data Export",
+      "description": "Run payroll and bulk-export comp/PII — insider exfiltration of the most sensitive records.",
+      "risk_rating": "High",
+      "mode": "AnyToAny",
+      "set_a": ["8ca7c085-684c-4cb4-b77c-89fe3396bc97"],
+      "set_b": ["9190994f-b898-4fc3-9694-376ca230cf03"],
+      "action": "Warn",
+      "compensating_control": "HR Director + DPO sign-off. Export activity logged, DLP-monitored, reviewed monthly."
+    },
+    {
+      "id": "SOD-010",
+      "name": "IAM Access Administrator / IAM Access Reviewer",
+      "description": "Grant access and certify it as appropriate — self-approval of your own entitlements.",
+      "risk_rating": "Critical",
+      "mode": "AnyToAny",
+      "set_a": ["a95ead07-7a3f-403b-8950-c7b4d5e050a3"],
+      "set_b": ["f4fc76ad-357f-4eec-87df-c542131f3d90"],
+      "action": "Block",
+      "compensating_control": "CISO sign-off. Provisioning and certification on separate identities."
+    },
+    {
+      "id": "SOD-011",
+      "name": "IAM Access Administrator / Azure Owner (Prod)",
+      "description": "Provision identities and hold Owner on production — grant yourself anything and cover it.",
+      "risk_rating": "Critical",
+      "mode": "AnyToAny",
+      "set_a": ["a95ead07-7a3f-403b-8950-c7b4d5e050a3"],
+      "set_b": ["46d1b79e-c7ef-48b2-bfcf-77612af69e85"],
+      "action": "Block",
+      "compensating_control": "CISO sign-off. PIM-gated, time-bound, no standing combination."
+    },
+    {
+      "id": "SOD-012",
+      "name": "Azure Owner (Prod) / Security Log Admin",
+      "description": "Hold prod Owner and control the audit logs that would record what you did — destroys the audit trail.",
+      "risk_rating": "Critical",
+      "mode": "AnyToAny",
+      "set_a": ["46d1b79e-c7ef-48b2-bfcf-77612af69e85"],
+      "set_b": ["aa2da4a1-70e4-43e3-903a-7c98193d57b9"],
+      "action": "Block",
+      "compensating_control": "CISO sign-off. Log platform admin separated from prod ownership."
     }
   ]
 }

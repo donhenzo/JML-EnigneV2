@@ -31,6 +31,7 @@ class EmploymentType(str, Enum):
     EMPLOYEE = "Employee"
     CONTRACTOR = "Contractor"
     GUEST = "Guest"
+    INTERN = "Intern"
 
 
 @dataclass
