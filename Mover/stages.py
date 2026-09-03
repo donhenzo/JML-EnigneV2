@@ -490,7 +490,7 @@ def stage_verify(
     durable: timer), so no sleep happens inside the stage.
 
     Reduces PostMoveVerificationResult (enum + discrepancy objects +
-    ValidationResult) to plain primitives — the status string, discrepancy
+    GovernanceResult) to plain primitives — the status string, discrepancy
     dicts, governance bool + warnings list — so nothing non-serializable
     crosses a future activity boundary. The driver maps the status string to
     the terminal MoverEventStatus, exactly as the current Step 9 does.
@@ -499,6 +499,7 @@ def stage_verify(
         graph_client     = graph_client,
         user_id          = user_id,
         employee_id      = payload.employee_id,
+        employment_type  = payload.employment_type.value,
         unchanged        = frozenset(unchanged),
         retain_set       = frozenset(retain_set),
         packages_to_add  = frozenset(packages_to_add),

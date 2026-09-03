@@ -1,0 +1,343 @@
+{
+  "version": "1.0.0",
+  "description": "PostProvision governance model. GUID-keyed classification of every managed group: tier, which employment types may hold it (allowedEmployment), and whether it is privileged (read directly, never inferred from tier). PostProvision reads a user's real memberOf and flags any held group whose allowedEmployment excludes the user's employment type. Groups NOT in this model are treated as unmanaged and skipped (like the Mover's NOT_PROCESSED). Guest is intentionally allowed on nothing by default, consistent with Guest being a restricted type in PreProvision, so any Guest in a managed group surfaces as a finding.",
+  "privileged_tiers": [
+    "Manager",
+    "Manager/Staff"
+  ],
+  "groups": {
+    "024066e1-5336-44a7-af19-e06edb0a8e46": {
+      "display_name": "SG_ERP_VendorMaintenance",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "e399aec7-59f6-41c5-8391-2aedad7a125c": {
+      "display_name": "SG_ERP_PaymentRun",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "d0f977ab-c825-41f9-b554-3e51307c1966": {
+      "display_name": "SG_ERP_APInvoiceEntry",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "13c4a49a-484f-4ed6-98ca-4059463a3bb6": {
+      "display_name": "SG_ERP_GLJournalPost",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "9400f410-e800-4936-ad1b-aa9ec4320907": {
+      "display_name": "SG_ERP_BankReconciliation",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "38b3d838-9fd4-4fb2-a111-9208c52e1f19": {
+      "display_name": "SG_Finance_Auditor",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "40f086db-6d11-4ae2-a8d0-ffe8c113c408": {
+      "display_name": "SG_Procure_POApprove",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "75a4d06c-f62d-4b5a-b8ca-59a5b035482e": {
+      "display_name": "SG_Procure_RequisitionCreate",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "44be5673-a535-4d6d-a6ec-9106688822a5": {
+      "display_name": "SG_Procure_GoodsReceipt",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "8ca7c085-684c-4cb4-b77c-89fe3396bc97": {
+      "display_name": "SG_Payroll_Administrator",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "b0a9e50f-466a-484e-aff7-9da5bc368312": {
+      "display_name": "SG_HRIS_EmployeeMasterData",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "9190994f-b898-4fc3-9694-376ca230cf03": {
+      "display_name": "SG_HR_DataExport",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "a95ead07-7a3f-403b-8950-c7b4d5e050a3": {
+      "display_name": "SG_IAM_AccessAdministrator",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "f4fc76ad-357f-4eec-87df-c542131f3d90": {
+      "display_name": "SG_IAM_AccessReviewer",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "46d1b79e-c7ef-48b2-bfcf-77612af69e85": {
+      "display_name": "SG_Azure_Owner_Prod",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "aa2da4a1-70e4-43e3-903a-7c98193d57b9": {
+      "display_name": "SG_Security_LogAdmin",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "15a3f8de-ac81-4305-b20b-133f7cb7c8a7": {
+      "display_name": "SG_Finance_BudgetApproval_PIM",
+      "tier": "Manager",
+      "allowed_employment": [
+        "Employee"
+      ],
+      "privileged": true
+    },
+    "d4f83747-b549-4ff6-82e2-707a5dc22ea4": {
+      "display_name": "SG_Finance_Core",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor"
+      ],
+      "privileged": false
+    },
+    "b11c8c70-5971-4768-a8fd-1777abc5b60a": {
+      "display_name": "SG_Finance_PowerBI",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor"
+      ],
+      "privileged": false
+    },
+    "cf3c41db-bc1a-4f55-9899-964fd5a09ee9": {
+      "display_name": "IT-Department",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    },
+    "95222bce-ccee-42f8-948b-08dae9e88f2f": {
+      "display_name": "GRP_GitHub_Enterprise",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    },
+    "6f27dd38-3648-4cd3-af11-f8d4433262c9": {
+      "display_name": "GRP_HR_Users",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    },
+    "35edfa06-4f41-46a6-990b-fd58e3ed91ed": {
+      "display_name": "GRP_DocuSign_Users",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    },
+    "7027bf77-e809-431b-a876-32430d832948": {
+      "display_name": "GRP_Workday_Users",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    },
+    "de9ea587-64bd-4eca-8a4c-aec4c319d462": {
+      "display_name": "GRP_Salesforce_Users",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    },
+    "a7d7b28c-6dc3-4cda-8649-266d8ba78278": {
+      "display_name": "Sales-Department",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    },
+    "6758ebab-b07c-4fbe-a93f-06a6849083e7": {
+      "display_name": "GRP_Sales_Users",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    },
+    "5db837c1-891a-4fcd-999b-fdd056b75928": {
+      "display_name": "GRP_PowerBI_Viewers",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    },
+    "384adcd5-02f2-4b37-8e44-6ae1df2b4b79": {
+      "display_name": "GRP_Jira_Users",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    },
+    "156d3a05-5c93-451b-95f2-60f9bd108c4d": {
+      "display_name": "GRP_SoftwareEngineering_Users",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    },
+    "68bbf962-ec0f-47d8-adb7-982293fa757f": {
+      "display_name": "GRP_Confluence_Users",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    },
+    "4f6184c6-43c5-44e7-843e-1f3dd589ab59": {
+      "display_name": "GRP_Cyber_SOC",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor"
+      ],
+      "privileged": false
+    },
+    "273985ee-14d7-4ae5-9101-9769e7db94c3": {
+      "display_name": "GRP_Cybersecurity_Users",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    },
+    "fa666ef3-2896-4417-afeb-8c0a508d7028": {
+      "display_name": "GRP_Company_Email",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    },
+    "23a26ce3-7c30-429f-af98-05c7f76fe973": {
+      "display_name": "GRP_All_Staff",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    },
+    "b35ef542-c600-484c-a13a-083d62dce837": {
+      "display_name": "GRP_MFA_Required",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    },
+    "659bcb41-1888-4814-9c5e-c6c3f60ed240": {
+      "display_name": "GRP_VPN_Access",
+      "tier": "Base",
+      "allowed_employment": [
+        "Employee",
+        "Contractor",
+        "Intern"
+      ],
+      "privileged": false
+    }
+  }
+}

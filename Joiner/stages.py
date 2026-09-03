@@ -41,7 +41,12 @@ from Functions.Event_store.conflict_queue import (
 from Mapping.mapping_loader import load_mapping_rules
 from Mapping.mapping_resolver import resolve_entitlements
 
-from Validation.validation_gate import post_provision_validate
+from governance.postprovision import (
+    run_postprovision,
+    load_governance_model,
+    load_sod_policies,
+)
+from Provisioning.graph_client import GraphClientError
 from governance.preprovision import run_preprovision
 from datetime import date
 from Audit.models import DecisionReport, ReportEvent
@@ -502,28 +507,53 @@ def stage_provision(
     )
 
 def stage_post_validate(
-    entra_id: str,
-    event_id: str,
-    employee_id: str = "",
+    payload:      IdentityPayload,
+    entra_id:     str,
+    event_id:     str,
+    graph_client: JmlGraphClient,
 ) -> StageResult:
     """
-    Post-provision governance gate — validate the real, now-provisioned Entra
-    object against expected state. Wraps post_provision_validate, which queries
-    the live tenant via the object ID (this stage DOES hit Graph, unlike the
-    pre-provision synthetic-snapshot gate).
+    Post-provision governance gate — in-process (ADR-019). Fetches the real
+    provisioned user's group memberships (memberOf) and runs the detective
+    check: employment/tier against governance_model.json + SoD against
+    sod_policies.json. Replaces the former HTTP call to the PowerShell engine.
+
+    Detective, not preventive: the user already exists and holds access by
+    this point. A failure marks the event Failed at PostProvisionValidation
+    and records the reason — it does not remediate (ADR-019; remediation is
+    the reconciliation pipeline's job, ADR-012).
 
     Outcomes:
-      PROCEED — validation passed; warnings ride back for the driver to record.
-      FAILED  — provisioning completed but the object didn't reach the expected
-                state. Distinct from a provisioning error: the driver marks the
-                event Failed with failure_step=PostProvisionValidation.
-
-    No client injection — post_provision_validate builds its own HTTP call to the
-    validation engine (or returns the skipped result when the engine is skipped).
+      PROCEED — governance passed. Warnings (Warn-level SoD) ride back for
+                the driver to record; they do not fail the event.
+      FAILED  — a Block-level violation or an unconfirmable memberOf read.
+                The driver marks the event Failed with
+                failure_step=PostProvisionValidation.
     """
-    result = post_provision_validate(
-        entra_object_id=entra_id,
-        employee_id=employee_id,
+    try:
+        member_of = graph_client.get_user_group_memberships(entra_id)
+    except GraphClientError as e:
+        logger.warning(
+            "Post-provision governance — memberOf fetch failed — object_id=%s, error=%s",
+            entra_id, str(e),
+        )
+        return StageResult(
+            ok=False,
+            outcome=StageOutcome.FAILED,
+            data={"event_id": event_id, "failure_step": "PostProvisionValidation"},
+            report_actions=[{
+                "action": "PostProvisionValidationFailed",
+                "detail": f"memberOf fetch failed: {e}",
+                "succeeded": False,
+            }],
+            summary=f"Post-provision governance could not read memberOf: {e}",
+        )
+
+    result = run_postprovision(
+        payload          = payload.to_dict(),
+        member_of        = member_of,
+        governance_model = load_governance_model(),
+        sod_policies     = load_sod_policies(),
     )
 
     if not result.passed:
@@ -550,7 +580,6 @@ def stage_post_validate(
         report_warnings=result.warning_summary(),
         summary="Post-provision validation passed",
     )
-
 
 
 

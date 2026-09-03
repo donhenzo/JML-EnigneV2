@@ -1219,6 +1219,73 @@ class JmlGraphClient:
             )
 
     @retry_on_throttle(max_retries=3, base_backoff=2.0)
+    def get_user_group_memberships(self, user_id: str) -> list[dict]:
+        """
+        Fetch all groups a user is a direct member of (memberOf).
+
+        Used by PostProvision governance: the unit here is raw group
+        membership, not access package assignments — the delivered duty groups
+        land in memberOf, and that is where tier/employment and SoD are
+        evaluated. Returns a list of {group_id, display_name}. The
+        microsoft.graph.group cast filters out directory roles and other
+        non-group objects memberOf can return. Pages via @odata.nextLink so a
+        user in many groups is never silently truncated.
+
+        Raises GraphClientError with status_code set.
+        """
+        import httpx
+
+        if self._credential is None:
+            raise GraphClientError(
+                "No credential available for get_user_group_memberships HTTP call. "
+                "Ensure JmlGraphClient is constructed via build_graph_client()."
+            )
+
+        endpoint = (
+            f"https://graph.microsoft.com/v1.0/users/{user_id}/memberOf"
+            "/microsoft.graph.group?$select=id,displayName&$top=999"
+        )
+        groups: list[dict] = []
+
+        try:
+            token = self._credential.get_token("https://graph.microsoft.com/.default")
+
+            while endpoint:
+                response = httpx.get(
+                    endpoint,
+                    headers={"Authorization": f"Bearer {token.token}"},
+                    timeout=30,
+                )
+
+                if response.status_code != 200:
+                    raise GraphClientError(
+                        f"get_user_group_memberships failed for {user_id} — "
+                        f"status={response.status_code}, body={response.text[:300]}",
+                        status_code=response.status_code,
+                    )
+
+                body = response.json()
+                for item in body.get("value", []):
+                    groups.append({
+                        "group_id":     item.get("id"),
+                        "display_name": item.get("displayName", ""),
+                    })
+
+                endpoint = body.get("@odata.nextLink")
+
+            return groups
+
+        except GraphClientError:
+            raise
+        except Exception as e:
+            status_code = _extract_status_code(e)
+            raise GraphClientError(
+                f"get_user_group_memberships failed for {user_id}: {e}",
+                status_code=status_code,
+            )
+
+
+    @retry_on_throttle(max_retries=3, base_backoff=2.0)
     def disable_user(self, user_id: str) -> None:
         """
         Disable an Entra ID account (Leaver Step 2, ADR-015).

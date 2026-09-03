@@ -229,7 +229,10 @@ def _execute_joiner_stages(
     entra_id = provision.data["entra_id"]
 
     # Post-provision validation
-    post = stage_post_validate(entra_id=entra_id, event_id=event_id, employee_id=employee_id)
+    post = stage_post_validate(
+        payload=normalised_payload, entra_id=entra_id,
+        event_id=event_id, graph_client=graph_client,
+    )
     apply(post)
 
     if post.outcome == StageOutcome.FAILED:

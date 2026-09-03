@@ -16,10 +16,14 @@ The orchestrator uses the result to set the final event status:
                     that failed to deliver surfaces — it's simply MISSING
                     from actual, no separate early-exit path needed)
 
-This module also calls the PowerShell validation engine in PostProvision
-mode via validation_gate.py. That check runs the full governance
-evaluation against the real Entra object — the same check the Joiner
-runs after provisioning.
+This module also runs the in-process PostProvision governance check
+(ADR-019) against the real Entra object — the same check the Joiner runs
+after provisioning. It is DETECTIVE: a finding means non-compliant access
+already exists; the response is to mark the move MOVE_PARTIAL and record the
+reason, not to remediate (remediation is the reconciliation pipeline's job,
+ADR-012). It reads the user's real group memberships (memberOf) and evaluates
+employment/tier against governance_model.json and Separation of Duties against
+sod_policies.json.
 
 Graph API eventual consistency:
     Access package assignment writes can take time to propagate. A
@@ -44,7 +48,12 @@ from enum import Enum
 from typing import Optional
 
 from Provisioning.graph_client import JmlGraphClient, GraphClientError
-from Validation.validation_gate import post_provision_validate, ValidationResult
+from governance.postprovision import (
+    run_postprovision,
+    load_governance_model,
+    load_sod_policies,
+    GovernanceResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +71,12 @@ class PostMoveStatus(str, Enum):
     MOVE_SUCCESS  — actual Entra state matches expected state exactly.
                     Governance validation passed.
     MOVE_PARTIAL  — assignment discrepancies found, or governance
-                    validation returned failures.
-    VERIFICATION_ERROR — Graph API call to fetch actual state failed.
-                         Cannot determine whether the move succeeded.
-                         Orchestrator marks the event MOVE_FAILED.
+                    validation returned failures, or the governance
+                    read could not complete.
+    VERIFICATION_ERROR — Graph API call to fetch actual package state
+                         failed. Cannot determine whether the move
+                         succeeded. Orchestrator marks the event
+                         MOVE_FAILED.
     """
     MOVE_SUCCESS       = "MOVE_SUCCESS"
     MOVE_PARTIAL       = "MOVE_PARTIAL"
@@ -102,16 +113,17 @@ class PostMoveVerificationResult:
         discrepancies:     List of AssignmentDiscrepancy — packages that
                            are missing or unexpected relative to expected
                            state. Empty on MOVE_SUCCESS.
-        governance_result: The ValidationResult from the PowerShell engine.
-                           Always present unless the fetch failed before
-                           the governance call could be made.
-        error:             Error message if status is VERIFICATION_ERROR.
+        governance_result: The GovernanceResult from the in-process
+                           PostProvision check (ADR-019). None if the
+                           memberOf read could not complete.
+        error:             Error message if status is VERIFICATION_ERROR,
+                           or if the governance read failed.
     """
     status:            PostMoveStatus
     expected_packages: frozenset[str]
     actual_packages:   frozenset[str]
     discrepancies:     list[AssignmentDiscrepancy]
-    governance_result: Optional[ValidationResult]
+    governance_result: Optional[GovernanceResult]
     error:             str = ""
 
 
@@ -193,6 +205,7 @@ def verify_post_move_state(
     graph_client:     JmlGraphClient,
     user_id:          str,
     employee_id:      str,
+    employment_type:  str,
     unchanged:        frozenset[str],
     retain_set:       frozenset[str],
     packages_to_add:  frozenset[str],
@@ -207,17 +220,21 @@ def verify_post_move_state(
         1. Assignment check — re-fetches actual access package
            assignments and compares against expected state
            (unchanged ∪ retain_set ∪ packages_to_add).
-        2. Governance check — calls the PowerShell validation engine in
-           PostProvision mode against the real Entra object.
+        2. Governance check — in-process PostProvision (ADR-019) against
+           the user's real group memberships.
 
-    Both checks always run unless the assignment fetch itself fails,
-    in which case the governance check is skipped and status is
-    VERIFICATION_ERROR.
+    The assignment check is the gate for VERIFICATION_ERROR: if it fails,
+    the move outcome is unknown and the governance check is skipped. A
+    governance-read failure is softer — the move landed, but governance
+    could not be confirmed, so the result is MOVE_PARTIAL, not FAILED.
 
     Args:
         graph_client:     Authenticated JmlGraphClient instance.
         user_id:          Entra object ID of the moved user.
         employee_id:      HR source identifier — used for log context only.
+        employment_type:  The user's employment type (Employee/Contractor/
+                          Guest/Intern) — the governance check evaluates each
+                          held group's allowed_employment against it.
         unchanged:        Packages the user held that are still valid
                           post-move. From MoverDelta.unchanged.
         retain_set:       Packages that survived retention evaluation.
@@ -240,8 +257,7 @@ def verify_post_move_state(
 
     Side effects:
         Sleeps for delay_seconds before the Graph fetch.
-        One Graph API call to fetch current access package assignments.
-        One HTTP call to the PowerShell validation engine.
+        Two Graph API calls — access package assignments, and memberOf.
     """
     expected_packages: frozenset[str] = unchanged | retain_set | packages_to_add
 
@@ -296,29 +312,43 @@ def verify_post_move_state(
             employee_id,
         )
 
-    # Step 3 — governance validation against real Entra object
+    # Step 3 — in-process governance validation against real memberOf (ADR-019).
+    # Detective: reports, does not remediate. A memberOf read failure does not
+    # fail the move (the packages already landed) — it leaves governance
+    # unconfirmed, which resolves to MOVE_PARTIAL below.
     logger.info(
-        "Post-move governance validation — employee=%s, user_id=%s",
+        "Post-move governance validation (in-process) — employee=%s, user_id=%s",
         employee_id, user_id,
     )
 
-    governance_result = post_provision_validate(
-        entra_object_id = user_id,
-        employee_id     = employee_id,
-    )
-
-    if not governance_result.passed:
-        logger.warning(
-            "Post-move governance validation failed — employee=%s, "
-            "failures=%s",
-            employee_id,
-            governance_result.failure_summary(),
+    governance_result: Optional[GovernanceResult] = None
+    governance_error = ""
+    try:
+        member_of = graph_client.get_user_group_memberships(user_id)
+        governance_result = run_postprovision(
+            payload          = {"employment_type": employment_type},
+            member_of        = member_of,
+            governance_model = load_governance_model(),
+            sod_policies     = load_sod_policies(),
         )
+        if not governance_result.passed:
+            logger.warning(
+                "Post-move governance validation failed — employee=%s, failures=%s",
+                employee_id, governance_result.failure_summary(),
+            )
+    except GraphClientError as e:
+        logger.error(
+            "Post-move governance — memberOf fetch failed — employee=%s, error=%s",
+            employee_id, str(e),
+        )
+        governance_error = str(e)
 
-    has_discrepancies = len(discrepancies) > 0
-    governance_failed = not governance_result.passed
+    # Final status: assignments verified above, so this is never
+    # VERIFICATION_ERROR. Discrepancies, a governance failure, or an
+    # unconfirmed governance read all resolve to MOVE_PARTIAL.
+    governance_failed = governance_result is None or not governance_result.passed
 
-    if has_discrepancies or governance_failed:
+    if discrepancies or governance_failed:
         status = PostMoveStatus.MOVE_PARTIAL
     else:
         status = PostMoveStatus.MOVE_SUCCESS
@@ -334,4 +364,5 @@ def verify_post_move_state(
         actual_packages    = actual_packages,
         discrepancies      = discrepancies,
         governance_result  = governance_result,
+        error              = governance_error,
     )
