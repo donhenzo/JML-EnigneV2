@@ -45,6 +45,12 @@ class GovernanceResult:
     warnings: list[Finding] = field(default_factory=list)
     matched_rule_ids: list[str] = field(default_factory=list)
 
+    def failure_summary(self) -> list[str]:
+        return [f"[{f.rule_id}] {f.details}" for f in self.failures]
+
+    def warning_summary(self) -> list[str]:
+        return [f"[{w.rule_id}] {w.details}" for w in self.warnings]
+
 
 def load_governance_model(path: str = GOVERNANCE_MODEL_PATH) -> dict:
     with open(path, encoding="utf-8") as handle:
