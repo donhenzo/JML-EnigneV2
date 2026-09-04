@@ -510,7 +510,7 @@ def stage_post_validate(
     payload:      IdentityPayload,
     entra_id:     str,
     event_id:     str,
-    graph_client: JmlGraphClient,
+    graph_client: JmlGraphClient | None = None,
 ) -> StageResult:
     """
     Post-provision governance gate — in-process (ADR-019). Fetches the real
@@ -530,6 +530,9 @@ def stage_post_validate(
                 The driver marks the event Failed with
                 failure_step=PostProvisionValidation.
     """
+    if graph_client is None:
+        graph_service_client, credential = build_graph_client()
+        graph_client = JmlGraphClient(graph_service_client, credential)
     try:
         member_of = graph_client.get_user_group_memberships(entra_id)
     except GraphClientError as e:
