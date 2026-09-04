@@ -457,6 +457,20 @@ def run_mover_pipeline(
         final_status = MoverEventStatus.MOVE_SUCCESS
 
     audit_record["post_move_status"] = final_status
+
+    if final_status == MoverEventStatus.MOVE_SUCCESS:
+        summary = "Mover event completed — MOVE_SUCCESS."
+    else:
+        pmv = audit_record.get("post_move_verification", {})
+        reasons = list(pmv.get("governance_failures", [])) + list(pmv.get("governance_warnings", []))
+        discrepancies = pmv.get("discrepancies", [])
+        if discrepancies:
+            reasons.append(
+                f"{len(discrepancies)} assignment discrepancy(ies): "
+                + ", ".join(f"{d['kind']}:{d['package_id']}" for d in discrepancies)
+            )
+        reason_text = "; ".join(reasons) if reasons else "see audit record"
+        summary = f"Mover {final_status} — {reason_text}."
     _write_event_log(
         table_client, employee_id, event_id, final_status,
         retention_applied=retention_applied,
@@ -489,7 +503,7 @@ def run_mover_pipeline(
         "final_status": final_status,
         "employee_id":  employee_id,
         "event_id":     event_id,
-        "summary":      f"Mover event completed with status {final_status}.",
+        "summary":      summary,
     }
 
 

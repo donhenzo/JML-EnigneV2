@@ -518,6 +518,10 @@ def stage_verify(
             verification.governance_result.passed
             if verification.governance_result else False
         ),
+        "governance_failures": (
+            verification.governance_result.failure_summary()
+            if verification.governance_result else []
+        ),
         "governance_warnings": (
             verification.governance_result.warning_summary()
             if verification.governance_result else []
