@@ -98,11 +98,14 @@ def _check_sod(
     held_ids: set[str],
     name_by_id: dict,
     sod_policies: dict,
-) -> tuple[list[Finding], list[Finding]]:
-    """Intersect held groups against each SoD pair. Block conflicts are failures,
-    Warn conflicts are warnings."""
-    failures = []
-    warnings = []
+) -> list[Finding]:
+    """Intersect held groups against each SoD pair. Post-delivery this is
+    DETECTIVE: every hit is recorded as a finding for review, Block and Warn
+    alike — the access already exists, so this cannot un-grant it. The Block
+    vs Warn distinction is preserved in the finding severity for the reviewer,
+    but neither fails the event. Preventive blocking is the platform's job
+    (incompatibility) and the Mover pre-flight (ADR-011), not this check."""
+    findings = []
 
     for policy in sod_policies.get("policies", []):
         hit_a = held_ids & set(policy.get("set_a", []))
@@ -112,19 +115,16 @@ def _check_sod(
 
         names_a = ", ".join(name_by_id.get(g, g) for g in sorted(hit_a))
         names_b = ", ".join(name_by_id.get(g, g) for g in sorted(hit_b))
-        finding = Finding(
+        findings.append(Finding(
             f"SOD/{policy.get('id', '')}",
             policy.get("risk_rating", "High"),
-            f"[{policy.get('id', '')}] {policy.get('name', '')} — "
-            f"holds conflicting groups: {names_a} + {names_b}",
-        )
+            f"[{policy.get('id', '')}] {policy.get('name', '')} "
+            f"({policy.get('action', 'Warn')}) — holds conflicting groups: "
+            f"{names_a} + {names_b}",
+        ))
 
-        if policy.get("action") == "Block":
-            failures.append(finding)
-        else:
-            warnings.append(finding)
+    return findings
 
-    return failures, warnings
 
 
 def run_postprovision(
@@ -134,6 +134,13 @@ def run_postprovision(
     sod_policies: dict,
 ) -> GovernanceResult:
     """Evaluate the detective gate against a user's real group memberships.
+
+    Detective posture (ADR-019): reports, does not remediate, and does not
+    block on SoD (the access already exists post-delivery). Employment/tier
+    violations are recorded as failures — an identity of the wrong employment
+    type in a restricted group is a genuine 'should not be here' finding. All
+    SoD conflicts are recorded as warnings for review, Block and Warn alike;
+    preventive blocking is the platform's and the Mover pre-flight's job.
 
     payload           — IdentityPayload.to_dict() (needs employment_type)
     member_of         — [{group_id, display_name}] from get_user_group_memberships
@@ -148,12 +155,11 @@ def run_postprovision(
     employment_type = payload.get("employment_type", "")
 
     failures = _check_employment_tier(employment_type, held_ids, name_by_id, governance_model)
-    sod_failures, sod_warnings = _check_sod(held_ids, name_by_id, sod_policies)
-    failures.extend(sod_failures)
+    sod_findings = _check_sod(held_ids, name_by_id, sod_policies)
 
     return GovernanceResult(
         passed=not failures,
         failures=failures,
-        warnings=sod_warnings,
-        matched_rule_ids=[f.rule_id for f in failures + sod_warnings],
+        warnings=sod_findings,
+        matched_rule_ids=[f.rule_id for f in failures + sod_findings],
     )
