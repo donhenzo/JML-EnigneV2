@@ -188,8 +188,7 @@ def record_and_finalize(state: dict) -> dict:
 
     entra_id = state["entra_id"]
     post = stage_post_validate(
-        payload=payload, entra_id=entra_id,
-        event_id=event_id, graph_client=graph_client,
+        payload=payload, entra_id=entra_id, event_id=event_id,
     )
     if post.outcome == StageOutcome.FAILED:
         stage_finalize(payload, event_id=event_id, final_status=EventStatus.FAILED,
