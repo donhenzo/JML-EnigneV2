@@ -6,7 +6,7 @@ The engine turns HR lifecycle events into governed access changes. It resolves p
 
 The complete **Joiner → Mover → Leaver** lifecycle has been tested end-to-end against a live Entra tenant, including downstream provisioning to **AWS IAM Identity Center through SCIM**.
 
-> **Core principle:** Governance decides whether access is allowed to happen. The engine validates the request before making identity or access changes, rather than provisioning first and checking afterwards.
+> **Core principle:** Governance decides whether access is allowed to happen. The engine validates the request before making identity or access changes, rather than provisioning first and checking afterwards — and it verifies the resulting state after delivery.
 
 ---
 
@@ -20,11 +20,12 @@ A Joiner starts with an HR record and no existing identity.
 flowchart TD
     HR["HR Record"] --> CI["Canonical Identity"]
     CI --> ER["Entitlement Resolution"]
-    ER --> GV["Governance Validation"]
-    GV --> CU["Create Entra Identity"]
+    ER --> PRE["PreProvision Governance<br/>attribute gate, in-process"]
+    PRE --> CU["Create Entra Identity"]
     CU --> SUB["Submit Access Package Requests"]
     SUB --> POLL["Poll for Delivery<br/>orchestrator-driven durable timer loop"]
-    POLL --> VER["Verify Tenant State"]
+    POLL --> POST["PostProvision Governance<br/>reads real memberOf, in-process"]
+    POST --> VER["Verify Tenant State"]
     VER --> AUD["Audit"]
 ```
 
@@ -46,7 +47,7 @@ The engine:
 6. Waits for delivery.
 7. Removes obsolete access.
 8. Updates identity attributes.
-9. Verifies the resulting tenant state.
+9. Verifies the resulting tenant state (including PostProvision governance).
 
 The critical property is **add-before-remove**.
 
@@ -62,7 +63,7 @@ flowchart LR
     ADD --> POLL1["Poll for Delivery<br/>durable timer loop"]
     POLL1 --> GATE{"All added<br/>delivered?"}
     GATE -->|Yes| REM["Remove"] --> POLL2["Poll for Removal<br/>durable timer loop"]
-    POLL2 --> ATTR["Update Attributes"] --> VER["Verify"]
+    POLL2 --> ATTR["Update Attributes"] --> VER["Verify + PostProvision"]
     GATE -->|No| DEFER["Defer removals<br/>+ attribute update"] --> VER
 ```
 
@@ -84,7 +85,7 @@ flowchart TD
     VO --> AUD["Audit"]
 ```
 
-The Leaver does not attempt to calculate what the user *should* have. It removes what the user currently holds.
+The Leaver does not attempt to calculate what the user *should* have. It removes what the user currently holds. It has no governance gate — removal is always the safe direction.
 
 This makes the workflow fail-safe: if a downstream cleanup operation fails, the account has already been prevented from authenticating.
 
@@ -94,38 +95,38 @@ Soft delete is subject to a configurable hold (`JML_LEAVER_SOFT_DELETE_HOLD_DAYS
 
 ---
 
-## Governance First
+## Governance
 
-The engine separates **policy**, **governance**, and **execution**.
+The engine separates **policy**, **governance**, and **execution**. Policy defines which entitlements an identity should receive; governance evaluates whether the request and the resulting state are permissible; execution writes to the tenant.
 
-Policy defines which entitlements an identity should receive. Governance evaluates whether those entitlements are permissible.
+Governance runs **in-process** inside the JML engine as two evaluation points — it is not a separate service or an HTTP call. Each is a small, event-relevant check: a lifecycle event supplies attributes and (post-delivery) real group memberships, and the check reasons about *this* identity, not the whole tenant. Tenant-wide, continuous scanning (RBAC, cross-plane exposure, MFA, hygiene, inactivity) is deliberately **out of scope** for the in-engine gate and belongs to the standalone Validation Engine (see Related Projects).
 
-For example, the policy model explicitly describes:
+### Two governance points, two different jobs
 
-* permitted employment types
-* privileged classifications
-* entitlement tiers
-* job-title-to-entitlement mappings
-* identity rules
-* access rules
-* RBAC rules
-* cross-plane exposure rules
-* hygiene controls
-
-Privileged access is represented explicitly in the entitlement model rather than inferred solely from naming conventions or group tiers.
-
-A governance failure blocks the lifecycle event.
+**PreProvision — preventive, blocks.** Before any Graph write, the canonical payload is evaluated on attributes alone (employment type vs job title, UPN format, employment status) with zero Graph calls. A failure **blocks** the event — the identity is never created, the record is held. This is the fail-closed gate.
 
 ```mermaid
 flowchart TD
     HE["HR Event"] --> NI["Normalize Identity"]
     NI --> RE["Resolve Entitlements"]
-    RE --> GV["Governance Validation"]
-    GV -->|Pass| MG["Microsoft Graph"]
-    GV -->|Fail| HQ["Hold Queue"]
+    RE --> PRE["PreProvision Governance<br/>attribute-only, zero Graph"]
+    PRE -->|Pass| MG["Microsoft Graph — create + assign"]
+    PRE -->|Fail| HQ["Hold Queue"]
 ```
 
-A failed Joiner or Mover therefore does not create an identity or modify access.
+**PostProvision — detective, records.** After delivery, the check reads the identity's real group memberships (`memberOf`) and evaluates them against the entitlement model (employment type vs the tier/privilege classification of each group actually held) and against the Separation of Duties catalogue. Because the access already exists by this point, PostProvision **does not block or un-grant** — it *records* findings for review. On the Mover a finding produces `MOVE_PARTIAL` with the reason captured in the audit record. This is the detective backstop that catches what preventive controls cannot: drift, direct-assignment conflicts, and Warn-level SoD.
+
+A failed **PreProvision** Joiner or Mover therefore does not create an identity or modify access. A **PostProvision** finding is surfaced and recorded, not silently dropped and not auto-remediated.
+
+### Separation of Duties — layered
+
+| Layer | When | Behaviour | Status |
+| --- | --- | --- | --- |
+| Platform incompatibility (Entra) | at assignment | Entra rejects a conflicting `adminAdd` on any provisioning path | Configured & proven |
+| Mover pre-flight (ADR-011) | before adds, in-engine | queries incompatibility, reorders (remove-first) or blocks a genuine conflict | Planned — next build |
+| PostProvision detective | after delivery | records SoD conflicts (including direct-assignment drift) for review | Built & proven |
+
+The Separation of Duties catalogue is **group-anchored** — conflicts are authored once against real group object IDs, and platform incompatibility is derived from that. Blocking SoD is the platform's and the pre-flight's job; the in-engine PostProvision layer is detective and does not block.
 
 ---
 
@@ -138,13 +139,13 @@ flowchart TD
     subgraph ENGINE["JML Engine"]
         CI["Canonical Identity"]
         ER["Entitlement Resolution<br/>Joiner: resolve · Mover: delta"]
-        GV["Governance Validation"]
-        CI --> ER --> GV
+        PRE["PreProvision Governance<br/>in-process, blocks"]
+        CI --> ER --> PRE
     end
 
     HR --> CI
-    GV -->|Pass| MG["Microsoft Graph"]
-    GV -->|Fail| HOLD["Hold Queue"]
+    PRE -->|Pass| MG["Microsoft Graph"]
+    PRE -->|Fail| HOLD["Hold Queue"]
 
     MG --> EM["Entra Entitlement Management"]
     EM --> AP["Access Packages"]
@@ -153,12 +154,13 @@ flowchart TD
     AP --> M365["Microsoft 365 Resources"]
 
     EM --> POLL["Delivery Polling"]
-    POLL --> VERIFY["Tenant State Verification"]
+    POLL --> POST["PostProvision Governance<br/>reads memberOf, records"]
+    POST --> VERIFY["Tenant State Verification"]
     VERIFY --> AUDIT["Audit"]
     HOLD --> AUDIT
 ```
 
-The execution layer is deliberately separated from the governance decision.
+The execution layer is deliberately separated from the governance decision, and governance is co-located with the orchestration that acts on it (no cross-service HTTP boundary).
 
 ### Execution Model — Durable Migration Status
 
@@ -178,14 +180,17 @@ Each pipeline also retains a synchronous execution path, used by the CSV/local r
 
 The lifecycle has been exercised against a live Entra tenant.
 
-| Lifecycle             | Result                                                   |
-| --------------------- | -------------------------------------------------------- |
-| **Joiner**            | Identity created and Access Packages delivered           |
-| **Mover**             | New access added, old access removed, attributes updated |
-| **Leaver**            | Account disabled, sessions revoked, packages removed     |
-| **AWS SCIM**          | Groups and users provisioned to AWS IAM Identity Center  |
-| **AWS authorization** | Permission Set assignment and EC2 access verified        |
-| **M365**              | Native group-based Teams/SharePoint access verified      |
+| Lifecycle             | Result                                                              |
+| --------------------- | ------------------------------------------------------------------ |
+| **Joiner**            | Identity created and Access Packages delivered                     |
+| **Mover**             | New access added, old access removed, attributes updated           |
+| **Leaver**            | Account disabled, sessions revoked, packages removed               |
+| **PreProvision gate** | Contractor targeting a management-tier role blocked before any write |
+| **PostProvision gate**| Contractor in a restricted duty group detected and recorded post-delivery |
+| **Platform SoD**      | Conflicting Access Package assignment denied by Entra at request time |
+| **AWS SCIM**          | Groups and users provisioned to AWS IAM Identity Center            |
+| **AWS authorization** | Permission Set assignment and EC2 access verified                  |
+| **M365**              | Native group-based Teams/SharePoint access verified               |
 
 The important part is that this is not only a policy simulation. The workflows execute against the real Entra tenant and verify the resulting state.
 
@@ -194,8 +199,11 @@ The important part is that this is not only a policy simulation. The workflows e
 ## Key Features
 
 * Governance-first Joiner, Mover, and Leaver automation
+* In-process governance: PreProvision (preventive, blocks) and PostProvision (detective, records)
 * Microsoft Entra Entitlement Management Access Packages
 * Policy-driven entitlement resolution using JSON configuration
+* Group-anchored Separation of Duties catalogue
+* Platform-level SoD enforcement via Access Package incompatibilities
 * Add-before-remove Mover sequencing
 * Disable-before-remove Leaver sequencing
 * Active PIM session termination during offboarding
@@ -229,15 +237,15 @@ The important part is that this is not only a policy simulation. The workflows e
 | Orchestration           | Azure Durable Functions (Joiner, Mover, Leaver)    |
 | Identity                | Microsoft Entra ID                                 |
 | API                     | Microsoft Graph                                    |
-| Governance              | Entra Identity Governance / Entitlement Management |
-| Authorization           | Access Packages                                    |
+| Governance              | In-process (Python) — PreProvision + PostProvision |
+| Continuous validation   | PowerShell Azure Function (standalone scanner)     |
+| Authorization           | Access Packages + Entra incompatibility (SoD)      |
 | Downstream provisioning | SCIM / Microsoft 365 groups                        |
 | Cloud                   | Microsoft Azure + AWS                              |
 | Storage                 | Azure Table Storage                                |
 | HR Source               | BambooHR                                           |
 | Authentication          | OIDC / Microsoft Graph client credentials          |
 | CI/CD                   | GitHub Actions                                     |
-| Validation              | PowerShell Azure Function                          |
 
 ---
 
@@ -261,7 +269,10 @@ The important part is that this is not only a policy simulation. The workflows e
 * Per-event audit reporting
 * Durable Functions execution for the Joiner, Mover, and Leaver (timer-driven entitlement polling)
 * Deferred soft-delete completion via durable timer (re-hire-safe)
-* Synthetic identity ID for pre-provision governance (payload side)
+* **In-process PreProvision governance gate (preventive, blocks) — proven on tenant**
+* **In-process PostProvision governance gate (detective, records; reads real memberOf) — proven on tenant**
+* **Platform-level Separation of Duties via Access Package incompatibilities — configured and proven**
+* **Group-anchored SoD catalogue and GUID-keyed governance model**
 * BambooHR ingestion
 * CSV execution
 * Direct HTTP lifecycle events
@@ -271,15 +282,18 @@ The important part is that this is not only a policy simulation. The workflows e
 
 ### In Progress / Planned
 
-* Synthetic identity consumption in the validation engine (re-coupling)
+* **Mover pre-flight blocking SoD (ADR-011)** — query Entra incompatibility before adds; reorder (remove-first) for a legitimate transition, block a genuine conflict. Next build.
+* Standalone Validation Engine as continuous, tenant-wide evaluation (scheduled scanner)
+* `employment_status` field + action-deriver Leaver rule
 * Last-state store for webhook-driven lifecycle processing
 * BambooHR webhook ingestion
-* Event-store recovery/reclaim
-* Reconciliation pipeline
+* Event-store recovery/reclaim for failed events
+* Reconciliation pipeline (event repair; also the home for automated remediation of detected drift)
 * Resumable recovery for a partially failed Leaver (the deferred-delete path is built; broader mid-run resume is not)
+* Reviewable Mover hold queue with release/resume
 * Entra Entitlement Management approval workflow integration
-* Separation of Duties enforcement (platform-level, via Access Package incompatibilities — ADR-008)
-* Platform-enforced incompatible Access Package pre-flight check (ADR-011)
+* Storage-enforced audit immutability (write-once blob)
+* Managed Identity authentication
 * Salesforce SCIM integration
 
 ---
@@ -326,7 +340,11 @@ This provides the interface required for eventual HR webhook integration.
 
 ### Governance before access
 
-Policy and governance are evaluated before provisioning.
+Policy and governance are evaluated before provisioning. The PreProvision gate can stop an event before any Graph write.
+
+### Detective backstop after access
+
+After delivery, PostProvision reads real tenant state and records anything preventive controls could not stop — drift, direct-assignment conflicts, Warn-level SoD. It reports; it does not remediate.
 
 ### Least privilege by policy
 
@@ -373,7 +391,7 @@ Each lifecycle event produces an audit record containing the decision and execut
 
 | Project                                     | Purpose                                                        |
 | ------------------------------------------- | -------------------------------------------------------------- |
-| **Validation Engine**                       | Detect governance violations across Microsoft Entra ID tenants |
+| **Validation Engine**                       | Standalone, continuous, tenant-wide detection of governance violations across Microsoft Entra ID (RBAC, cross-plane, hygiene, drift). Separate from the JML in-engine gate. |
 | **Catalog Recommendation Engine**           | Analyse existing entitlements and recommend Access Packages    |
 | **Policy-Driven Identity Lifecycle Engine** | Governed Joiner, Mover, and Leaver orchestration               |
 

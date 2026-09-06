@@ -25,7 +25,7 @@
 
 ## 1. System Overview
 
-This engine automates the identity lifecycle — Joiner, Mover, Leaver — for Microsoft Entra ID. Most provisioning systems create the identity first and check the access afterwards, in an access review or a certification cycle weeks later. This engine reverses that order. Policy resolution and governance validation run *before* any Microsoft Graph write. If a record fails policy, nothing is created and nothing is changed. Every decision — pass or fail — is written as a per-event audit record at the moment it happens, not reconstructed from logs during an audit. (Write-once immutable storage for those records is planned, not yet in place — §9, §11.)
+This engine automates the identity lifecycle — Joiner, Mover, Leaver — for Microsoft Entra ID. Most provisioning systems create the identity first and check the access afterwards, in an access review or a certification cycle weeks later. This engine reverses that order. Policy resolution and governance validation run *before* any Microsoft Graph write. If a record fails policy, nothing is created and nothing is changed. After delivery, a second governance check reads the real tenant state and records anything the preventive controls could not catch. Every decision — pass, fail, or a post-delivery finding — is written as a per-event audit record at the moment it happens, not reconstructed from logs during an audit. (Write-once immutable storage for those records is planned, not yet in place — §9, §11.)
 
 Access is delivered through Entra ID Entitlement Management Access Packages, never through direct group assignment (ADR-007). This is the single most consequential decision in the system. The engine reasons about packages; Entra delivers the groups, licences, and roles bundled inside them. A rule resolves to an `accessPackageId` and a `policyId`, an assignment request is submitted and polled to delivery, and group membership is a downstream consequence the engine never touches directly.
 
@@ -37,9 +37,9 @@ Three lifecycle branches sit on top of that primitive:
 
 Joiner and Mover share almost the entire pipeline and diverge only in the middle, at entitlement resolution. The Leaver is structurally different — it has no target state to resolve toward, so it skips resolution, delta, and retention entirely and moves in one direction: removal.
 
-The stack is Microsoft-native throughout. Python 3.11 on Azure Functions orchestrates the flow, Microsoft Graph is the only execution interface, Azure Table Storage holds event and audit state, and a separately deployed PowerShell function runs governance validation over HTTP. HR events come from BambooHR live or from CSV for offline testing.
+The stack is Microsoft-native throughout. Python 3.11 on Azure Functions orchestrates the flow, Microsoft Graph is the only execution interface, and Azure Table Storage holds event and audit state. Governance validation runs **in-process** inside the engine (ADR-019) — it is not a separate service or an HTTP call. HR events come from BambooHR live or from CSV for offline testing.
 
-All three lifecycle branches are implemented and have run end to end against a live Entra ID tenant. The engine is deployed to Azure Functions (Flex Consumption) through a GitHub Actions CI/CD pipeline authenticated by OIDC; every change is tested against the tenant on the local Functions runtime first, then deployed. All three pipelines' provisioning runs as Azure Durable Functions orchestrations in that deployment — their delivery polls are orchestrator-driven timer loops rather than blocking waits. Several productionization pieces remain deliberately unbuilt: authentication is still Microsoft Graph client credentials in both environments (Managed Identity is not yet adopted), the governance validation engine is decoupled at the HTTP boundary and skipped in current runs until it is itself deployed, and Joiner audit reports are written as local JSON rather than to immutable blob storage. This is an honest middle state — live in Azure, but with productionization still in progress — and Section 11 (Azure Deployment), Section 12 (Architectural Boundaries), and Section 13 (Future Evolution) state exactly where each line falls.
+All three lifecycle branches are implemented and have run end to end against a live Entra ID tenant. The engine is deployed to Azure Functions (Flex Consumption) through a GitHub Actions CI/CD pipeline authenticated by OIDC; every change is tested against the tenant on the local Functions runtime first, then deployed. All three pipelines' provisioning runs as Azure Durable Functions orchestrations in that deployment — their delivery polls are orchestrator-driven timer loops rather than blocking waits. Governance runs in-process as two evaluation points: a preventive PreProvision gate (blocks before any write) and a detective PostProvision check (reads real `memberOf` after delivery and records findings). Platform-level Separation of Duties is configured in Entra and proven. Several productionization pieces remain deliberately unbuilt: authentication is still Microsoft Graph client credentials in both environments (Managed Identity is not yet adopted), and Joiner audit reports are written as local JSON rather than to immutable blob storage. This is an honest middle state — live in Azure, but with productionization still in progress — and Section 11 (Azure Deployment), Section 12 (Architectural Boundaries), and Section 13 (Future Evolution) state exactly where each line falls.
 
 ---
 
@@ -49,17 +49,19 @@ The architecture rests on four ideas. Everything else is a consequence of them.
 
 ### 2.1 Governance Decides Whether Provisioning Happens
 
-The governance gate is not a post-provisioning audit. It runs *before* the first Graph write and it can stop the event. A canonical identity that fails validation never reaches Microsoft Graph — no user object is created, no package is assigned, and the record is held with structured reason codes for review.
+The PreProvision governance gate is not a post-provisioning audit. It runs *before* the first Graph write and it can stop the event. A canonical identity that fails validation never reaches Microsoft Graph — no user object is created, no package is assigned, and the record is held with structured reason codes for review.
 
 This is the fail-closed contract. Degraded or incomplete input data blocks the event rather than proceeding on assumption. A false block is recoverable through human review; a missed violation, once written to the directory, is not. The system is built to fail in the recoverable direction.
 
-The Leaver inverts the *sequencing* of this idea rather than dropping it. It has no entitlement gate to clear — removal is always safe — but it applies the same fail-safe instinct by disabling the account and revoking sessions before it touches any access. A partial failure downstream still leaves a terminated employee locked out.
+There is a second, complementary governance point *after* delivery — the PostProvision check (§5.3) — but it is detective, not preventive: the access already exists by that point, so it records findings for review rather than blocking. Blocking is the PreProvision gate's job and the platform's; detection of what slipped past them is PostProvision's.
+
+The Leaver inverts the *sequencing* of the preventive idea rather than dropping it. It has no entitlement gate to clear — removal is always safe — but it applies the same fail-safe instinct by disabling the account and revoking sessions before it touches any access. A partial failure downstream still leaves a terminated employee locked out.
 
 ### 2.2 Access Packages Are the Provisioning Unit
 
-Entitlements resolve to Access Package IDs, not group object IDs (ADR-007). The delta engine operates on packages. The retention registry keys on packages. Post-provision verification queries the `assignments` resource filtered to delivered state, not `memberOf`.
+Entitlements resolve to Access Package IDs, not group object IDs (ADR-007). The delta engine operates on packages. The retention registry keys on packages. Post-provision verification queries the `assignments` resource filtered to delivered state; the separate detective governance check reads `memberOf`.
 
-This choice buys three things. Assignment is governed by Entra's own Entitlement Management policies, and access-package incompatibility relationships give Separation of Duties a natural platform-level home — the engine is designed to delegate SoD there rather than reimplement it, though that enforcement is planned, not yet configured (ADR-008, §5.4). Delivery is asynchronous and observable — a submitted request has a `state` the engine can poll to a terminal outcome rather than assume. And the unit of access maps to a business role rather than a scattered set of group memberships, which keeps both the policy model and the audit trail legible.
+This choice buys three things. Assignment is governed by Entra's own Entitlement Management policies, and access-package incompatibility relationships give Separation of Duties a natural platform-level home — the engine delegates preventive SoD there rather than reimplementing it, and those incompatibility relationships are configured in the tenant and proven (ADR-008, §5.4). Delivery is asynchronous and observable — a submitted request has a `state` the engine can poll to a terminal outcome rather than assume. And the unit of access maps to a business role rather than a scattered set of group memberships, which keeps both the policy model and the audit trail legible.
 
 ### 2.3 Layers With Single Responsibility
 
@@ -72,7 +74,7 @@ flowchart TD
     NORM["Normalization<br/>canonical identity"]
     EVT["Event Store<br/>idempotency · locking · supersede"]
     POL["Policy Resolution<br/>entitlements from rules"]
-    GOV["Governance<br/>SoD · validation gate"]
+    GOV["Governance<br/>PreProvision gate · PostProvision detective"]
     PROV["Provisioning<br/>Graph · Entitlement Management"]
     VER["Verification<br/>real tenant state"]
     AUD["Audit<br/>per-event report"]
@@ -89,7 +91,7 @@ flowchart TD
 
 The boundaries are strict and they are the reason each layer can be tested and changed in isolation. Provisioning holds no policy logic. The policy engine makes no Graph calls. The audit layer makes no provisioning decisions. Change an access rule and the provisioning code is untouched; change how a package is assigned and the policy model doesn't move.
 
-The governance validation engine sits behind an HTTP boundary as a separate PowerShell Azure Function in its own repository. The Python pipeline calls it and receives a structured pass-or-fail response. The two systems version and deploy independently — the governance rule set can change without redeploying the engine, and vice versa.
+Governance runs in-process (ADR-019) as pure, testable functions co-located with the orchestration that acts on them — there is no cross-service HTTP boundary. The in-engine gate is deliberately small and event-relevant: it reasons about *this* identity's attributes (PreProvision) and *this* identity's real memberships (PostProvision). Tenant-wide, continuous scanning (RBAC, cross-plane exposure, MFA, hygiene, inactivity) is out of scope for the in-engine gate and is the responsibility of the standalone Validation Engine, a separate product.
 
 ### 2.4 Deterministic and Idempotent by Construction
 
@@ -120,17 +122,17 @@ The Joiner pipeline runs as an ordered sequence of stages. A record only reaches
 1. **HR record ingestion.** An HR record enters from BambooHR or CSV and is normalized into a canonical identity.
 2. **Event Store claim.** A SHA-256 EventId is derived from the identity and claimed atomically in the Event Store. A duplicate claim exits immediately with no side effects — this is what makes retries and duplicate HR triggers safe.
 3. **Entitlement resolution.** The canonical identity is evaluated against policy rule objects to resolve which Access Packages the identity should hold. Multiple rules can contribute, and every resolved entitlement is traceable to the rule ID that produced it.
-4. **Governance validation (pre-provision).** The canonical identity and resolved entitlements are submitted to governance validation before any Entra ID object exists. This is a synthetic-payload evaluation — zero Graph calls, no side effects.
-5. **Lock acquisition.** Only once governance validation passes does the pipeline acquire the Event Store processing lock. A record that never clears the gate never holds a lock.
+4. **PreProvision governance gate (in-process).** The canonical payload is evaluated on attributes alone before any Entra ID object exists — employment type versus job title, UPN format, employment status. Zero Graph calls, no side effects. A failure blocks the event and routes it to the hold queue.
+5. **Lock acquisition.** Only once the gate passes does the pipeline acquire the Event Store processing lock. A record that never clears the gate never holds a lock.
 6. **User creation.** The Entra ID user object is created via Microsoft Graph.
 7. **Access Package assignment.** The engine submits an Access Package assignment request for each resolved package.
 8. **Delivery polling.** Each assignment request is polled to a terminal delivery state before the pipeline considers the assignment complete.
-9. **Post-provision verification.** The real, now-provisioned Entra ID object is checked against the intended entitlement set.
+9. **Post-provision verification and PostProvision governance.** The real, now-provisioned Entra ID object is checked against the intended entitlement set, and the detective PostProvision check reads the identity's real `memberOf` and records any employment/tier or SoD finding.
 10. **Audit report.** A structured report is written for the event regardless of outcome, and the Event Store lock is released.
 
 In the deployed Azure runtime, stages 6 through 10 execute as an Azure Durable Functions orchestration rather than one blocking call. The HTTP entry point returns `202 Accepted` immediately with a status URL, and an orchestrator drives the sequence — create user, wait for user propagation on a durable timer, submit the package requests, then poll delivery through a check-activity-and-timer loop before recording and finalizing. The two waits that were `time.sleep` calls in the synchronous path (user propagation and the delivery poll interval) become orchestrator timers that hold no compute, so a delivery that takes minutes completes rather than being cut off at the gateway timeout. The synchronous Joiner path is retained alongside the durable one; §7.8 covers the orchestration in full. The Mover and Leaver have since been migrated the same way (§3.2, §3.3, §7.8).
 
-Separation of Duties is not a stage on this path. SoD enforcement is planned as a platform-level control in Entra Entitlement Management (§5.4), not a Python check inside the pipeline. When configured, a conflicting assignment surfaces as a `Denied` request state during delivery polling (stage 8) rather than as a separate gate before provisioning.
+Separation of Duties is not a preventive stage on this path. Preventive SoD is a platform-level control in Entra Entitlement Management (§5.4): a conflicting assignment surfaces as a `Denied` request state during delivery polling (stage 8), not as a separate gate before provisioning. The detective PostProvision check (stage 9) additionally records any SoD conflict present in the real membership.
 
 ### 3.1.3 Sequence Diagram
 
@@ -151,11 +153,12 @@ sequenceDiagram
     ES-->>J: Duplicate, exit with no side effects
     ES-->>J: Claimed
     J->>J: Resolve Access Packages
-    J->>H: Governance Validation fail, hold record
+    J->>H: PreProvision gate fail, hold record
     J->>ES: Acquire lock (gate passed)
     J->>G: Create user
     J->>EM: Submit Access Package Assignment requests
     EM-->>J: Poll to delivered
+    J->>J: PostProvision governance (reads memberOf, records)
     J->>G: Post-Provision Verification
     J->>A: Audit report
     J->>ES: Release lock, Completed
@@ -164,7 +167,7 @@ sequenceDiagram
 
 ### 3.1.4 Why the Lock Comes After the Gate
 
-The Event Store lock is acquired only after governance validation passes, not on claim. A record that fails normalization or governance validation is held and never takes a lock at all — both hold-queue exits happen upstream of lock acquisition. This keeps the lock's lifetime scoped to work that is actually going to touch Microsoft Graph.
+The Event Store lock is acquired only after the PreProvision gate passes, not on claim. A record that fails normalization or the gate is held and never takes a lock at all — both hold-queue exits happen upstream of lock acquisition. This keeps the lock's lifetime scoped to work that is actually going to touch Microsoft Graph.
 
 ### 3.1.5 Why Assignment Is Submitted, Then Polled, Not Assumed
 
@@ -179,7 +182,7 @@ Unlike the Mover, the Joiner does not compute a delta. Entitlement resolution ru
 The Joiner pipeline depends on, but does not redefine:
 
 - **Event Store** — for idempotent claim and lock lifecycle (§6).
-- **Governance validation** — for the pre-provision gate (§5.3).
+- **Governance** — for the in-process PreProvision gate and PostProvision detective check (§5.3).
 - **Provisioning** — for user creation, package assignment, and delivery polling (§7).
 - **Post-provision verification** — for confirming the real tenant state after assignment (§7).
 - **Audit** — for the per-event report (§9).
@@ -207,7 +210,7 @@ flowchart TD
     RET --> ADD["Add New Packages<br/>adminAdd → poll → confirm"]
     ADD -.all delivered.-> REMOVE["Remove Old Packages<br/>adminRemove confirmed set only"]
     ADD -.any failed.-> SKIP["Removals Skipped<br/>ADR-009 safety gate"]
-    REMOVE --> VERIFY["Post-Move Verification"]
+    REMOVE --> VERIFY["Post-Move Verification<br/>+ PostProvision governance"]
     SKIP --> VERIFY
     VERIFY --> AUDIT["Audit Record<br/>MoverAuditLog + release_lock"]
 
@@ -257,7 +260,7 @@ The delta engine is a pure function with no I/O. It takes three inputs — the u
 
 **Unchanged** — currently held and still required by the new role. No action needed, but included in the expected state for post-move verification.
 
-**Unmanaged** — currently held but not present anywhere in the managed catalogue. These are packages assigned outside the engine (manually in the portal, through a different workflow, or from a rule that was later deleted). The engine does not touch them, does not evaluate them for retention, and does not include them in SoD checks. They are recorded in the audit report as `NOT_PROCESSED` (ADR-005) and excluded from the post-move verification's unexpected-membership check so their presence doesn't trigger a false discrepancy.
+**Unmanaged** — currently held but not present anywhere in the managed catalogue. These are packages assigned outside the engine (manually in the portal, through a different workflow, or from a rule that was later deleted). The engine does not touch them, does not evaluate them for retention, and does not include them in preventive SoD execution. They are recorded in the audit report as `NOT_PROCESSED` (ADR-005) and excluded from the post-move verification's unexpected-membership check so their presence doesn't trigger a false discrepancy. Note that the *detective* PostProvision check (§3.2.10) still reads real `memberOf` and will surface a conflict a directly-assigned unmanaged group creates — detection is not the same as removal.
 
 ### 3.2.5 Retention Evaluation
 
@@ -273,9 +276,11 @@ The engine reads from `RetentionRegistry` but does not write to it. Population r
 
 ### 3.2.6 SoD Posture
 
-The Mover does not run a Python-side Separation of Duties check before executing access changes (ADR-008). SoD enforcement is delegated to the platform level — Entra ID Entitlement Management access package incompatibility policies. The intent is that when the engine submits an `adminAdd` request for a new package, Microsoft evaluates the configured incompatibility relationships and rejects the request if a conflict exists. Those incompatibility policies are not yet configured, so this enforcement point is planned rather than active (§5.4).
+Preventive Separation of Duties on the Mover is delegated to the platform (ADR-008): Entra Entitlement Management access-package incompatibility policies are configured in the tenant and proven. When the engine submits an `adminAdd` for a new package, Microsoft evaluates the configured incompatibility relationships and rejects the request if a conflict exists — the rejection surfaces through the polling step as a `denied`/`failed` delivery state (§7.4).
 
-A pre-flight incompatibility check (ADR-011) is designed but deferred. When built, it will query Entra's `incompatibleAccessPackages` and `incompatibleGroups` endpoints before submitting requests, and select between two execution strategies rather than always assuming add-first is safe. Until then, Strategy A (add-before-remove) is the only execution path, and a platform rejection surfaces through the polling step as a `denied` or `failed` delivery state. The durable execution model (§3.2.13) is built to accommodate ADR-011 without restructuring: its submit, check, and finalize activities are generic over an operation (add or remove), so a future remove-first Strategy B becomes an ordering branch in the orchestrator rather than a rewrite of the activities. That branch is not built — only the structure that would host it.
+A pre-flight incompatibility check (ADR-011) is the next build. It queries Entra's `incompatibleAccessPackages` and `incompatibleGroups` endpoints *before* submitting, and selects between two execution strategies rather than always assuming add-first is safe: **remove-first** when the conflicting held item is in the removal set (a legitimate transition — old role leaving), and **block** when the user is keeping the conflicting access (a genuine violation). Until it lands, Strategy A (add-before-remove) is the only execution path and a platform rejection is the fallback signal. The durable execution model (§3.2.13) is built to host the pre-flight without restructuring: its submit, check, and finalize activities are generic over an operation (add or remove), so the remove-first Strategy B is an ordering branch in the orchestrator rather than a rewrite of the activities.
+
+The detective PostProvision check (§3.2.10) additionally records — but does not block — any SoD conflict present in the user's real `memberOf` after the move, including conflicts created by direct group assignment that the platform incompatibility layer cannot see.
 
 ### 3.2.7 Execution Ordering — ADR-009
 
@@ -286,6 +291,8 @@ This is the most architecturally significant decision in the Mover pipeline. The
 The reason is a failure-mode analysis. If the engine removes old access first and the subsequent addition fails (transient Graph error, incompatibility rejection, polling timeout), the user is left with strictly less access than they had before the move — no old role access, no new role access. That's a worse outcome than the alternative failure mode under add-first ordering, where a failed removal leaves the user temporarily holding both old and new access until the next run or manual cleanup resolves it. Stale-but-present access is recoverable. Missing access disrupts the employee's work immediately.
 
 The gate is all-or-nothing: removals only proceed if every package in the addition set reached a `Delivered` state. There is no guaranteed one-to-one pairing between an added package and a removed package in a given delta (a department change might add one package and remove two, or vice versa), so per-pair gating would be both complex and semantically wrong. The addition set either fully delivered or it didn't.
+
+The ADR-011 pre-flight (§3.2.6) is the one case that deliberately overrides this ordering — for a specific package whose conflict is with something being removed, it goes remove-first — precisely to avoid a platform rejection that add-first would otherwise cause. Strategy A remains the default for every non-conflicting package.
 
 ### 3.2.8 Package Assignment and Polling
 
@@ -311,9 +318,9 @@ Expected = unchanged ∪ retain_set ∪ packages_to_add
 
 Two categories are excluded from the unexpected-assignment check: unmanaged packages (outside the managed catalogue by design) and recently removed packages (confirmed removed but possibly not yet propagated due to Graph eventual consistency). A configurable delay (default 10 seconds) runs before the fetch to account for propagation lag.
 
-The PowerShell governance validation engine then runs in PostProvision mode against the real Entra object — the same check the Joiner runs after provisioning. Currently decoupled via `JML_SKIP_VALIDATION_ENGINE=true` and reintegrated once the validation engine is itself deployed alongside the pipeline.
+The in-process PostProvision governance check then runs against the real Entra object — the same check the Joiner runs after provisioning (§5.3). It reads the user's real `memberOf`, evaluates each held group's classification against the entitlement model (employment type versus the tier/privilege of each group) and runs the SoD intersection. This is **detective**: the move has already happened, so a finding is *recorded*, not blocked or reversed. An employment/tier violation (e.g. a Contractor found holding a Manager-tier duty group) or an SoD conflict produces a governance failure captured in the audit record.
 
-A clean verification produces `MOVE_SUCCESS`. Any discrepancy — a missing expected package, an unexpected unaccounted-for package, or a governance validation failure — produces `MOVE_PARTIAL`. A verification fetch failure produces `MOVE_FAILED`.
+A clean verification produces `MOVE_SUCCESS`. Any discrepancy — a missing expected package, an unexpected unaccounted-for package, or a PostProvision governance finding — produces `MOVE_PARTIAL` with the reason recorded. A verification fetch failure produces `MOVE_FAILED`.
 
 ### 3.2.11 Mover Sequence
 
@@ -326,7 +333,6 @@ sequenceDiagram
     participant G as Microsoft Graph
     participant EM as Entitlement Mgmt
     participant RR as RetentionRegistry
-    participant V as Validation Engine
     participant A as MoverAuditLog
 
     HR->>E: Identity record (new dept/title)
@@ -348,7 +354,7 @@ sequenceDiagram
     E->>EM: adminRemove for each remove_confirmed
     E->>G: PATCH user attributes
     E->>G: Re-fetch assignments (post-move)
-    E->>V: PostProvision governance check
+    E->>E: PostProvision governance (reads memberOf, records)
     E->>A: MoverAuditRecord
     E->>ES: release_lock() + Completed/Failed
 ```
@@ -357,11 +363,12 @@ sequenceDiagram
 
 | ADR | Decision | Effect on the Mover |
 |-----|----------|-------------------|
-| ADR-005 | Unmanaged access is not touched | Packages outside the managed catalogue are excluded from removal, SoD, and retention — recorded as NOT_PROCESSED |
+| ADR-005 | Unmanaged access is not touched | Packages outside the managed catalogue are excluded from removal and retention — recorded as NOT_PROCESSED. (Detective PostProvision still surfaces a conflict they create.) |
 | ADR-007 | Access Packages are the provisioning unit | Delta operates on package IDs, not group IDs. Group membership is a downstream consequence |
-| ADR-008 | SoD enforcement at the platform level | No Python SoD check before writes. Entra's own incompatibility policies are the intended enforcement point (planned, §5.4) |
+| ADR-008 | Preventive SoD at the platform level | No Python preventive SoD check before writes. Entra's own incompatibility policies are the enforcement point (configured and proven, §5.4) |
 | ADR-009 | Add-before-remove ordering | Additions must be confirmed delivered before any removal executes. A failed addition never results in access loss |
-| ADR-011 | Pre-flight incompatibility check (deferred) | When built, queries Entra's configured incompatibility relationships to choose between add-first (Strategy A) and remove-first (Strategy B) per package |
+| ADR-011 | Pre-flight incompatibility check (next build) | Queries Entra's configured incompatibilities before submitting to choose add-first (Strategy A), remove-first (Strategy B), or block a genuine conflict |
+| ADR-019 | In-process governance | PreProvision gate and detective PostProvision check run in-process, not over HTTP |
 
 ### 3.2.13 Durable Execution
 
@@ -375,10 +382,10 @@ pre (claim → concurrent check → fetch current state + lock → resolve → d
   → ADR-009 gate: all additions delivered?
         yes → submit removals → loop: check → break/timer → finalize removals → patch attributes
         no  → skip removals + attribute patch, record the deferral
-  → verify → finalize (audit + release lock)
+  → verify + PostProvision governance → finalize (audit + release lock)
 ```
 
-Three properties matter here. First, the **ADR-009 gate is a branch in the orchestrator, never inside an activity** — the decision to run the removal loop depends on the result of the addition loop, and only the orchestrator sees both. This is the durable expression of the same add-before-remove rule §3.2.7 describes: it is enforced by control flow, not by an activity's internal logic. Second, **both poll loops are timer-driven** — where the synchronous path called `time.sleep` between polls, the orchestrator yields a durable timer that holds no compute, so an addition or removal that takes several minutes to deliver completes rather than being cut off at the HTTP gateway timeout. A Mover whose two loops together exceed that timeout — the exact case that fails synchronously — runs to completion while the orchestrator sleeps between checks. Third, the **submit, check, and finalize activities are generic over an operation** (add or remove) rather than bound to one; the orchestrator calls the same three activities twice with the operation flipped. This is what keeps a future ADR-011 remove-first Strategy B an ordering change in the orchestrator rather than a duplication of activities (§3.2.6) — the structure is built to host it, though Strategy B itself is not built.
+Three properties matter here. First, the **ADR-009 gate is a branch in the orchestrator, never inside an activity** — the decision to run the removal loop depends on the result of the addition loop, and only the orchestrator sees both. This is the durable expression of the same add-before-remove rule §3.2.7 describes: it is enforced by control flow, not by an activity's internal logic. Second, **both poll loops are timer-driven** — where the synchronous path called `time.sleep` between polls, the orchestrator yields a durable timer that holds no compute, so an addition or removal that takes several minutes to deliver completes rather than being cut off at the HTTP gateway timeout. A Mover whose two loops together exceed that timeout — the exact case that fails synchronously — runs to completion while the orchestrator sleeps between checks. Third, the **submit, check, and finalize activities are generic over an operation** (add or remove) rather than bound to one; the orchestrator calls the same three activities twice with the operation flipped. This is what keeps the future ADR-011 remove-first Strategy B an ordering change in the orchestrator rather than a duplication of activities (§3.2.6) — the structure is built to host it.
 
 State crosses every activity boundary as plain serializable data. The `PendingPackage` record that tracks a request through submission and delivery is built from scalar fields only, so it moves between the submit, check, and finalize activities as a dictionary and reconstructs on the other side; the retention decisions cross as primitive dicts with dates already reduced to ISO strings. Nothing that holds a live client or a non-serializable object is passed across the boundary — the same discipline the Joiner's orchestration follows (§7.8).
 
@@ -386,9 +393,9 @@ State crosses every activity boundary as plain serializable data. The `PendingPa
 
 ## 3.3 Leaver
 
-The Leaver pipeline offboards a terminated identity. It is structurally different from the Joiner and Mover — there is no entitlement resolution, no delta calculation, no retention evaluation, and no governance validation gate. The pipeline's only question is: what does this user currently hold, and how do we remove all of it safely?
+The Leaver pipeline offboards a terminated identity. It is structurally different from the Joiner and Mover — there is no entitlement resolution, no delta calculation, no retention evaluation, and no governance gate. The pipeline's only question is: what does this user currently hold, and how do we remove all of it safely?
 
-That simplicity is deliberate, not accidental. A Leaver has no target state to resolve towards. Its target is `current − everything`. The architectural decisions that make the Joiner and Mover complex — policy resolution, delta sets, retention records, SoD checks — exist to answer "what should this person have?" A terminated employee's answer is always the same.
+That simplicity is deliberate, not accidental. A Leaver has no target state to resolve towards. Its target is `current − everything`. The architectural decisions that make the Joiner and Mover complex — policy resolution, delta sets, retention records, governance checks — exist to answer "what should this person have?" A terminated employee's answer is always the same.
 
 ### 3.3.1 Why the Leaver Pipeline Has a Different Shape
 
@@ -578,7 +585,7 @@ sequenceDiagram
 | `LeaverEventLog` | Leaver event status tracking | Leaver only |
 | `LeaverAuditLog` | Completed Leaver audit records | Leaver only |
 
-No `LeaverHoldQueue` exists. The Leaver has no governance gate or SoD check that would hold an event — a Graph API failure routes straight to `Failed` on `JmlEvents`. This is a structural simplification, not an omission (see §8.5 for the recovery-path gap this leaves open).
+No `LeaverHoldQueue` exists. The Leaver has no governance gate that would hold an event — a Graph API failure routes straight to `Failed` on `JmlEvents`. This is a structural simplification, not an omission (see §8.5 for the recovery-path gap this leaves open).
 
 ### 3.3.14 ADR Dependencies
 
@@ -626,15 +633,16 @@ The three lifecycle pipelines are not three separate systems. They share a commo
 | Event Store (claim · lock · deterministic ID) | ✓ | ✓ | ✓ | §6 State, Idempotency & Concurrency |
 | Conflict queue (FIFO · Leaver supersede) | ✓ | ✓ | ✓ | §6 State, Idempotency & Concurrency |
 | Entitlement resolution | ✓ | ✓ | — | §5 Governance |
-| Governance validation gate | ✓ | ✓ | — | §5 Governance |
+| PreProvision governance gate (preventive) | ✓ | ✓ | — | §5 Governance |
+| PostProvision governance check (detective) | ✓ | ✓ | — | §5 Governance |
 | Graph / Entitlement Management client | ✓ | ✓ | ✓ | §7 Provisioning |
 | Post-provision / post-offboarding verification | ✓ | ✓ | ✓ | §7 Provisioning |
 | Hold queue | ✓ | ✓ | — | §8 Failure Handling |
 | Audit record | ✓ | ✓ | ✓ | §9 Audit Architecture |
 
-Two things stand out. The Event Store, the conflict queue, the Graph client, verification, and the audit contract are used by all three pipelines — that is the true shared core. The governance machinery (normalization, resolution, the validation gate, the hold queue) is shared by Joiner and Mover but skipped entirely by the Leaver, because a terminated identity has no target state to resolve toward and removal needs no gate.
+Two things stand out. The Event Store, the conflict queue, the Graph client, verification, and the audit contract are used by all three pipelines — that is the true shared core. The governance machinery (normalization, resolution, the two governance points, the hold queue) is shared by Joiner and Mover but skipped entirely by the Leaver, because a terminated identity has no target state to resolve toward and removal needs no gate.
 
-Separation of Duties is deliberately absent from the table above: no pipeline enforces it today. It is planned as a platform-level control delegated to Entra Entitlement Management, and §5.4 states exactly where that stands.
+Preventive Separation of Duties is not a pipeline-side check — it is a platform control in Entra Entitlement Management, configured and proven, and §5.4 states exactly how the layers fit together.
 
 ### 4.2 The Event Store
 
@@ -644,13 +652,13 @@ Separation of Duties is deliberately absent from the table above: no pipeline en
 
 The mapping resolver evaluates named policy rules from `role_mapping_rules.json` against a canonical identity and unions the matched entitlements into a set of Access Package assignments, each traceable to the rule ID that produced it. The Joiner runs it once. The Mover runs it twice — old role and new role — and diffs the results. The Leaver never runs it. Because every entitlement carries its rule ID, every access decision is traceable back to policy in the audit report. Section 5 covers the rule schema and the resolution model.
 
-### 4.4 Governance Validation
+### 4.4 Governance
 
-Governance validation is a separately deployed PowerShell Azure Function, called over HTTP. It evaluates a canonical payload before provisioning (synthetic snapshot, zero Graph calls) and the real object after provisioning (against actual tenant state). The Python side wraps both calls behind a single gate that blocks on any failure and passes warnings through without blocking. The engine is currently decoupled at this boundary for independent testing — the call is skipped via `JML_SKIP_VALIDATION_ENGINE=true` — and is reintegrated once the PowerShell validation engine is itself deployed as its own function app (the pipeline is already in Azure; the validation engine is the piece not yet deployed). Section 5 covers the request modes, the response contract, and the two gates.
+Governance runs **in-process** inside the JML engine (ADR-019) as two evaluation points — it is not a separate service or an HTTP call. The **PreProvision gate** evaluates the canonical payload on attributes alone before any Graph write (zero Graph calls) and *blocks* a failing record. The **PostProvision check** reads the real provisioned object's `memberOf` after delivery and *records* findings — it is detective, not preventive, because the access already exists by that point. Both are small, event-relevant, pure functions co-located with the orchestration. Tenant-wide scanning rules (RBAC, cross-plane, MFA, hygiene, inactivity) are deliberately out of scope for the in-engine gate and belong to the standalone Validation Engine. Section 5 covers the two evaluation points, their contract, and the SoD layering.
 
-### 4.5 Separation of Duties (Planned)
+### 4.5 Separation of Duties (Layered)
 
-No pipeline enforces Separation of Duties today. The design intent (ADR-008) is to delegate it to Entra Entitlement Management access-package incompatibility policies, so that Entra rejects an `adminAdd` request when it would produce a conflicting combination — enforcement at the platform, not reimplemented in the engine. This is not yet built or configured. Section 5.4 covers the intended model and the reasoning behind delegating rather than owning the check.
+Separation of Duties is enforced in layers. **Preventive** enforcement is a platform control (ADR-008): access-package incompatibility relationships are configured in Entra and proven — Entra rejects an `adminAdd` that would produce a conflicting combination, on any provisioning path, and the rejection surfaces to the engine as a `denied`/`failed` delivery state. The **Mover pre-flight** (ADR-011) is the next build: it queries those incompatibilities before submitting and reorders (remove-first) or blocks a genuine conflict. The **detective** layer is the in-engine PostProvision check, which reads real `memberOf` and records any conflict — including direct-assignment drift the platform layer cannot see — for review. The SoD catalogue is group-anchored, and Section 5.4 covers the layering and the reasoning behind delegating preventive enforcement to the platform rather than owning it in the engine.
 
 ### 4.6 Provisioning Interface
 
@@ -664,15 +672,17 @@ Every event produces exactly one record, written at the time of processing regar
 
 ## 5. Governance Architecture
 
-Governance in this engine is not a scan you run afterwards. It is the set of controls that decide whether provisioning happens at all, and they run before the first Microsoft Graph write. Three of them: policy resolves entitlements from validated attributes, a validation gate evaluates the result against a governance rule set, and Separation of Duties conflicts are (by design) rejected at the platform. Two of the three are built. The third is planned. This section says which is which.
+Governance in this engine runs in-process (ADR-019) at two points in the lifecycle, and it decides different things at each. Before the first Microsoft Graph write, a preventive gate can stop the event. After delivery, a detective check reads the real tenant state and records what the preventive controls could not catch. This section covers entitlement resolution, the two governance points, and the layered Separation of Duties model.
 
 ### 5.1 The Governance-First Model
 
-The ordering is the whole point. Entitlements are resolved from a canonical identity, checked, and only then written. A record that fails resolution or validation is held with structured reason codes and never reaches the tenant — no user object, no package assignment, nothing to remediate later.
+The ordering is the whole point. Entitlements are resolved from a canonical identity, checked, and only then written. A record that fails resolution or the PreProvision gate is held with structured reason codes and never reaches the tenant — no user object, no package assignment, nothing to remediate later.
 
 This is fail-closed by design. If the input data is degraded or a dependency returns an incomplete result, the event blocks rather than proceeding on a guess. A false block is recoverable through review; a bad grant, once written to the directory, has to be found and reversed. The system is built to fail in the recoverable direction.
 
-The Leaver sits outside this model. It has no entitlement to resolve and no gate to clear — removal is always the safe direction — so it skips resolution and validation entirely. Governance, for the Leaver, means the fail-safe sequencing covered in §3.3, not a pre-provision gate.
+The detective PostProvision check sits *after* the write and is a complement, not a duplicate, of the gate: because the access already exists by then, it records findings for review rather than blocking. The dangerous, blockable cases are stopped upstream (PreProvision + platform SoD); PostProvision is the backstop that surfaces what prevention structurally could not — drift, direct-assignment conflicts, and Warn-level SoD.
+
+The Leaver sits outside this model. It has no entitlement to resolve and no gate to clear — removal is always the safe direction — so it skips resolution and the governance points entirely. Governance, for the Leaver, means the fail-safe sequencing covered in §3.3.
 
 ### 5.2 Entitlement Resolution
 
@@ -705,58 +715,35 @@ Three properties matter architecturally.
 
 The Joiner resolves once, against the incoming record. The Mover resolves twice — once against the user's current Entra attributes (old role) and once against the incoming record (new role) — and diffs the two sets to drive its delta. The Leaver never resolves. Resolution is a pure evaluation over policy and identity; it makes no Graph calls and has no side effects, which is why it can run before anything is written and be unit-tested without a tenant.
 
-### 5.3 The Validation Gate
+### 5.3 The Two Governance Points
 
-Resolution decides what access *should* exist. The validation gate decides whether an identity is *fit to provision*. It is a separately deployed PowerShell Azure Function — the Identity Governance Validation Engine — called over HTTP. The two systems are decoupled at that boundary and version independently: the governance rule set can change without redeploying the Python engine.
+Resolution decides what access *should* exist. Governance decides whether the identity is *fit to provision* (before the write) and whether the resulting state is *governed* (after delivery). Both run in-process (ADR-019) as pure functions — no external service, no HTTP boundary.
 
-The gate runs in two modes.
+**PreProvision — preventive, blocks.** Before any Entra object exists, the canonical payload is evaluated on attributes alone, with zero Graph calls: employment type versus job title (a Contractor, Guest, or Intern may not hold a management-tier role), UPN format, and employment status. A failure **blocks** the event — the identity is never created, the record is held in the hold queue as `ValidationFailed`. This is the fail-closed gate. It is deliberately small and attribute-only: it cannot read memberships (nothing exists yet) and it does not try to.
 
-**PreProvision (payload).** Before any Entra object exists, the canonical payload is evaluated against a synthetic snapshot. Zero Graph calls, no side effects. This is the pre-provision gate — employment-type constraints, UPN conflicts, missing manager associations, and privilege-tier checks all run here against an identity that does not yet exist.
-
-```json
-{
-  "mode": "PreProvision",
-  "payload": {
-    "EmployeeId": "E501", "UPN": "claire.dubois@contoso.com",
-    "Department": "Finance", "JobTitle": "Head of Finance",
-    "EmploymentType": "Employee", "Action": "Joiner"
-  }
-}
+```
+Employment type × job title  →  ENT-004  (block a restricted type in a management-tier role)
+UPN format                   →  IDENT-002
+Employment status = Active   →  JOIN-001  (activates when the field is present)
 ```
 
-**PostProvision (state).** After provisioning, the gate fetches the real object and evaluates actual tenant state. Hygiene rules (`HYG-*`) are demoted to warnings on this path regardless of their blocking flag — a freshly created account has never signed in and cannot have MFA registered yet, so treating those as failures would block every legitimate new identity.
+**PostProvision — detective, records.** After delivery, the check reads the identity's real group memberships (`memberOf`) and evaluates them against two catalogues: the **governance model** (each group's tier, permitted employment types, and privileged flag — read directly, never inferred from tier) and the **SoD catalogue** (group-anchored conflict pairs). An employment/tier violation — for example a Contractor found holding a Manager-tier, Employee-only duty group — is a finding; an SoD conflict is a finding.
 
-```json
-{ "mode": "PostProvision", "targetUserId": "entra-object-id" }
-```
+Because the access already exists by this point, PostProvision **does not block or un-grant** — it *records* for review. On the Joiner a finding marks the event failed with the reason captured in the audit record; on the Mover a finding produces `MOVE_PARTIAL` with the governance failure recorded. It never reverses the write: removing a detected conflict is remediation, which is the reconciliation pipeline's job (ADR-012), not the verification step's. This is the detective backstop that catches what preventive controls cannot — drift, a conflict assembled by direct group assignment, or a Warn-level SoD pair that the platform (Block-only) never blocks.
 
-Both calls return the same shape, and the Python side wraps them behind one gate:
+The governance result carries `failures` (employment/tier violations, which fail the event) and `warnings` (SoD conflicts, which are recorded but do not fail on their own), each tagged with the rule ID and a human-readable reason so the audit record names exactly what was found.
 
-```json
-{
-  "passed": true,
-  "failures": [],
-  "warnings": [
-    { "ruleId": "HYG-004", "category": "Hygiene", "severity": "Critical",
-      "details": "Privileged account has no MFA registration or MFA is not enforced." }
-  ],
-  "matchedRuleIds": ["HYG-004"]
-}
-```
+### 5.4 Separation of Duties (Layered)
 
-The contract is simple: any entry in `failures` blocks provisioning and routes the record to the hold queue as `ValidationFailed`; `warnings` pass through without blocking. The gate decides pass or fail; it never decides what to provision.
+Separation of Duties is enforced in layers, each covering what the others cannot. Being precise about the split matters, because "SoD" spans preventive and detective controls in different places.
 
-**Current status.** The validation gate is decoupled for independent testing. Runs skip the call via `JML_SKIP_VALIDATION_ENGINE=true`, and the gate is reintegrated once the PowerShell validation engine is deployed as its own function app and the two run in the same environment. The pipeline itself is already in Azure; it is the validation engine that is not yet deployed. The design is complete and the contract is stable; the integration is toggled off in current runs. This is stated plainly because the rest of this section describes a gate that is present in the architecture but not active in every run today.
+**Preventive — platform (ADR-008), configured and proven.** Access Packages are the provisioning unit, so preventive SoD belongs where the packages live. Entra Entitlement Management supports incompatibility relationships between access packages: package A configured incompatible with package B, and Entra rejects any assignment that would give one identity both — on the JML path, the portal, self-service My Access, or any other Graph caller. There are no blind spots the way an engine-only check would have. A rejection surfaces to the engine through the delivery-polling it already does, as a `denied`/`failed` `state` on the `adminAdd` (§7.4). The incompatibility relationships are configured in the tenant and proven (a conflicting assignment is denied at request time). The SoD catalogue is authored **group-anchored** — conflicts are defined once against real group object IDs, and the platform package-level configuration is derived from that, so the two express one intent rather than two catalogues that can drift.
 
-### 5.4 Separation of Duties (Planned)
+**Preventive — Mover pre-flight (ADR-011), next build.** Platform incompatibility rejects a conflicting add *after* the engine submits it. The pre-flight makes the engine aware of the constraint *before* submitting, so it can plan rather than fail-and-fall-through. It queries Entra's `incompatibleAccessPackages`/`incompatibleGroups` for the packages in play and chooses per package: **add-first** (Strategy A, the default) when there is no conflict; **remove-first** (Strategy B) when the conflicting held item is in the removal set — a legitimate role transition where the old conflicting access is leaving anyway; and **block** when the user is *keeping* the conflicting access — a genuine violation the move must not create. A blocked Mover writes to a hold record and makes no change; the user stays in their current role, untouched. The durable Mover's op-generic activities host Strategy B as an ordering branch (§3.2.13). This is the next governance capability; §13 tracks it.
 
-No pipeline enforces Separation of Duties today. This is a deliberate design position, not an oversight, and it is worth being precise about.
+**Detective — in-engine PostProvision (§5.3), built and proven.** Preventive controls act on packages; a conflict can still arise from a group assigned directly, outside any package, which the package-level platform check cannot see. The detective PostProvision check reads the real `memberOf` and records any SoD conflict present in it, whatever its source. It does not block — the access already exists — it records for review. This is also the only layer that surfaces the Warn-level SoD pairs, which the platform (Block-only) deliberately does not enforce.
 
-The group-based predecessor to this engine ran a Python preventive SoD check against the effective access set before any write, plus a detective check inside the validation engine's tenant scan. Moving to Access Packages changes where that control belongs. Entra Entitlement Management supports incompatibility relationships between access packages: configure package A as incompatible with package B, and Entra rejects an assignment request that would give one identity both. That rejection surfaces through the same delivery-polling the engine already does — a `denied` or `failed` `state` on the `adminAdd` request — so the engine gets SoD enforcement without reimplementing the conflict catalogue or fetching current memberships to evaluate it.
-
-The decision (ADR-008) is to delegate SoD to that platform mechanism rather than own it in Python. The trade is clear: the platform is the authoritative place to enforce incompatibility on packages, and a single enforcement point beats two catalogues that can drift apart. What remains is to configure the incompatibility relationships in the tenant and to build the pre-flight check (ADR-011) that would query Entra's configured incompatibilities before submitting requests, so the engine can choose an add-first or remove-first strategy per package rather than always assuming add-first is safe. Both are designed and neither is built.
-
-Until then, SoD is not enforced anywhere in the pipeline. The engine will not create a conflicting combination through policy that happens to be clean, but it also does not stop one. §13 tracks this as the next governance capability.
+The layers are complementary: platform prevention stops the blockable package-to-package cases at assignment; the pre-flight makes the Mover choose ordering or block before a rejection; detection catches the residue — direct-assignment drift and Warn-level conflicts — after the fact. Remediation of a *detected* conflict (removing access already granted) is deliberately not any of these layers' job; it is the reconciliation pipeline's (ADR-012), §13.
 
 ---
 
@@ -790,10 +777,10 @@ The atomic claim isn't quite enough on its own. Two instances can both pass `cla
 
 Where the lock is acquired differs by pipeline, and the difference is meaningful:
 
-- **Joiner** acquires the lock *after* the governance gate passes. A record that never clears validation never takes a lock — both hold-queue exits happen upstream, so the lock's lifetime is scoped only to work that will actually touch Graph.
+- **Joiner** acquires the lock *after* the PreProvision gate passes. A record that never clears the gate never takes a lock — both hold-queue exits happen upstream, so the lock's lifetime is scoped only to work that will actually touch Graph.
 - **Mover** and **Leaver** acquire the lock *after* the current-state fetch succeeds, because both need the user's real tenant state before they can do anything, and there is no pre-fetch gate to wait on.
 
-Locks expire automatically after ten minutes. A crashed instance therefore does not block the next run indefinitely — a stale lock is reset to `Pending` and reclaimed. And `release_lock()` is called on every exit path, success or failure: a SoD hold, a removal failure, an early Graph error at the fetch step. No row stays locked after processing ends.
+Locks expire automatically after ten minutes. A crashed instance therefore does not block the next run indefinitely — a stale lock is reset to `Pending` and reclaimed. And `release_lock()` is called on every exit path, success or failure: a hold, a removal failure, an early Graph error at the fetch step. No row stays locked after processing ends.
 
 ### 6.5 The Event State Machine
 
@@ -846,8 +833,8 @@ Microsoft Graph is the only place this engine writes. Every user creation, packa
 
 The client uses two calling styles depending on what the SDK models well:
 
-- **SDK-native calls** for the well-modelled surface: user create and fetch, group membership check and add, RBAC assignment check and create, account disable, and delete.
-- **Raw `httpx` calls** for the endpoints the SDK does not fully model: everything under Entitlement Management (`assignmentRequests`, `assignments`), all of PIM (eligibility and active-session schedules), and `revokeSignInSessions`. These build the request, attach a bearer token from the same credential, and read the JSON back directly.
+- **SDK-native calls** for the well-modelled surface: user create and fetch, group membership check and add, account disable, and delete.
+- **Raw `httpx` calls** for the endpoints the SDK does not fully model: everything under Entitlement Management (`assignmentRequests`, `assignments`), the user's `memberOf` read the detective governance check uses, all of PIM (eligibility and active-session schedules), and `revokeSignInSessions`. These build the request, attach a bearer token from the same credential, and read the JSON back directly.
 
 The client also owns three exception types — `GraphClientError`, `UserNotFoundError`, and `GraphThrottlingError` — so nothing above it ever catches an SDK-specific exception or inspects a raw HTTP status. `UserNotFoundError` is kept distinct from a general error specifically so the pipeline can tell a clean `404` (the UPN doesn't exist yet, which on a Joiner is the normal case) from a real failure without parsing exception text.
 
@@ -874,7 +861,6 @@ The pipeline has to be safe to retry from the beginning. A crash after user crea
 |---|---|
 | `get_user` | `create_user` |
 | `check_group_membership` | `add_group_member` |
-| `check_rbac_assignment` | `create_rbac_assignment` |
 | `check_package_assignment` | `request_package_assignment` |
 
 The provisioner always calls the check first. On user creation the logic is slightly richer, because "the user already exists" means different things depending on context: if the event is in a `Processing` state — a genuine retry of an in-flight event — the existing user is accepted and the pipeline resumes from where it left off; if it is not a retry, an existing UPN is a duplicate-identity conflict and the event fails. Two reads of the same tenant state, two different correct conclusions, disambiguated by the event's own status.
@@ -891,19 +877,19 @@ The key property is that assignment is **asynchronous**. Submitting the request 
 2. **Poll for transitions.** The engine polls each submitted request until it reaches a terminal state — delivered, denied, failed, or canceled — checking every five seconds up to a ceiling of sixty attempts (a five-minute wait before a package is declared timed out).
 3. **Record and summarise.** Each package's terminal state is written to the audit report, and a single summary line reports how many were submitted, delivered, and failed.
 
-Two design choices in that loop are worth calling out. First, **only state transitions are logged**, never individual poll attempts — so the log reads identically whether Entra delivers a package in ten seconds or five minutes, and each transition line carries the previous state, the new state, and the elapsed time. Second, a `Denied` terminal state is recorded as a failure and attributed to a likely platform incompatibility (ADR-008). That is the seam where platform-level Separation of Duties would surface: when incompatibility policies are configured in the tenant, Entra rejects a conflicting assignment and the rejection arrives here as a `Denied` request. The handling is already wired; the incompatibility policies are not yet configured (§5.4), so today that path is latent rather than active.
+Two design choices in that loop are worth calling out. First, **only state transitions are logged**, never individual poll attempts — so the log reads identically whether Entra delivers a package in ten seconds or five minutes, and each transition line carries the previous state, the new state, and the elapsed time. Second, a `Denied` terminal state is recorded as a failure and attributed to a platform incompatibility (ADR-008). That is the seam where platform-level Separation of Duties surfaces: incompatibility policies are configured in the tenant, so Entra rejects a conflicting assignment and the rejection arrives here as a `Denied` request — a proven, active path, not a latent one. The future ADR-011 pre-flight (§5.4) makes the engine anticipate that rejection rather than merely react to it.
 
 ### 7.5 Provisioning Against Eventual Consistency
 
 Graph is eventually consistent across services, and the pipeline has to account for that in two concrete places rather than pretend writes are instantaneous.
 
-After a user is created, the provisioner waits fifteen seconds before submitting the first package assignment. Entitlement Management resolves the target user against a separate index that lags user creation, and without the wait the first assignment can fail with `SubjectNotFound` — the user exists, but the package system can't see it yet. Similarly, post-provision and post-move verification wait a configurable delay (default ten seconds) before re-fetching, because a membership or assignment change returns success from Graph before it has fully propagated. These waits are not padding; they are the price of reading back state you just wrote.
+After a user is created, the provisioner waits fifteen seconds before submitting the first package assignment. Entitlement Management resolves the target user against a separate index that lags user creation, and without the wait the first assignment can fail with `SubjectNotFound` — the user exists, but the package system can't see it yet. Similarly, post-provision and post-move verification wait a configurable delay (default ten seconds) before re-fetching, because a membership or assignment change returns success from Graph before it has fully propagated. These waits are not padding; they are the price of reading back state you just wrote. The detective PostProvision `memberOf` read is subject to the same lag — on the durable path the delivery poll has already waited for packages to land, so the groups they deliver are present by the time membership is read.
 
 ### 7.6 Reading Current State
 
-For the Mover and Leaver, current state is the set of *delivered Access Package assignments*, not raw group membership. `get_current_access_package_assignments` queries the `assignments` resource filtered to `state eq 'delivered'`, expanding each assignment with its access package and its assignment policy ID. This matters for two reasons. The assignment — not `memberOf` — is the unit the engine reasons about, because groups are a downstream consequence of package delivery. And the expanded `assignmentPolicy.id` is the policy a later `adminRemove` request must cite: when the Mover or Leaver removes a package, it uses the policy ID from the real assignment on the tenant, not a re-derivation from the rules file. Tenant state is authoritative for what policy governs an existing assignment.
+For the Mover and Leaver, current state is the set of *delivered Access Package assignments*, not raw group membership. `get_current_access_package_assignments` queries the `assignments` resource filtered to `state eq 'delivered'`, expanding each assignment with its access package and its assignment policy ID. This matters for two reasons. The assignment — not `memberOf` — is the unit the engine reasons about for the delta, because groups are a downstream consequence of package delivery. And the expanded `assignmentPolicy.id` is the policy a later `adminRemove` request must cite: when the Mover or Leaver removes a package, it uses the policy ID from the real assignment on the tenant, not a re-derivation from the rules file. Tenant state is authoritative for what policy governs an existing assignment.
 
-The `assignments` resource (with its `state` field) and the `assignmentRequests` resource (which tracks a request through to delivery) are distinct resources with distinct field names. The engine reads current state from the first and tracks in-flight work through the second.
+A separate read — `get_user_group_memberships` (`/users/{id}/memberOf`) — is used only by the detective PostProvision governance check, because governance evaluates the *effective* group set (where a directly-assigned conflicting group would show up), which the package-assignment view cannot see. The `assignments` resource (with its `state` field) and the `assignmentRequests` resource (which tracks a request through to delivery) are distinct resources with distinct field names. The engine reads current package state from the first, tracks in-flight work through the second, and reads effective group membership through `memberOf` for governance.
 
 ### 7.7 Verify the Tenant, Not the Response
 
@@ -918,14 +904,14 @@ The mechanism is a decomposition of the provisioning phases into sleep-free func
 ```
 pre_provision → create_user → timer(user propagation) → submit_packages →
    loop (bounded): check_packages → all terminal? break : timer(poll interval) →
-record_and_finalize (record results → post-provision verify → finalize)
+record_and_finalize (record results → post-provision verify → PostProvision governance → finalize)
 ```
 
 Each stage is a Durable *activity*; the orchestrator is the conductor. State crosses every activity boundary as plain serializable data — the `PendingPackage` record, deliberately built from scalar fields only, moves between the submit and check activities as a dictionary and reconstructs on the other side. The HTTP entry point (`joiner-durable`) is a thin starter that returns `202 Accepted` with a status URL and hands off to the orchestrator; the caller never blocks on delivery. Because the two waits are timers rather than blocking calls, a delivery that takes several minutes completes cleanly — a duration that would previously have exceeded the HTTP gateway timeout and failed now simply runs to completion while the orchestrator sleeps between polls.
 
-The provisioning phase functions are shared, not duplicated: the synchronous `provision_joiner` composes them with `time.sleep`, and the orchestrator composes the same functions with timers. This is why the synchronous Joiner path can be retained unchanged alongside the durable one — both call one implementation, differing only in who owns the waiting.
+The provisioning phase functions are shared, not duplicated: the synchronous `provision_joiner` composes them with `time.sleep`, and the orchestrator composes the same functions with timers. This is why the synchronous Joiner path can be retained unchanged alongside the durable one — both call one implementation, differing only in who owns the waiting. Because the in-process governance functions are pure, both PreProvision and PostProvision are called identically from either path — a stage in the sync driver, an activity in the durable one — with no HTTP boundary either way.
 
-The **Mover** was migrated the same way, and because it polls twice — an addition loop and a removal loop, gated by ADR-009 — it is the pipeline that most exercised the model; §3.2.13 describes its orchestration. The **Leaver** followed, with the simplest shape of the three: one removal poll loop and no gate, with the disable-and-revoke fail-safe run in the pre-removal activity so it holds regardless of how the removal loop proceeds; §3.3.15 describes it. The Leaver's **deferred soft-delete** also uses this model: when the hold is nonzero the orchestrator arms a durable timer for the hold and, on wake, completes the deletion through a dedicated activity that re-checks the account is still disabled before deleting (§3.3.15). That closes the one piece of this seam that was previously only a plan.
+The **Mover** was migrated the same way, and because it polls twice — an addition loop and a removal loop, gated by ADR-009 — it is the pipeline that most exercised the model; §3.2.13 describes its orchestration. The **Leaver** followed, with the simplest shape of the three: one removal poll loop and no gate, with the disable-and-revoke fail-safe run in the pre-removal activity so it holds regardless of how the removal loop proceeds; §3.3.15 describes it. The Leaver's **deferred soft-delete** also uses this model: when the hold is nonzero the orchestrator arms a durable timer for the hold and, on wake, completes the deletion through a dedicated activity that re-checks the account is still disabled before deleting (§3.3.15).
 
 ### 7.9 Permissions
 
@@ -933,11 +919,10 @@ The provisioning client needs the following application permissions on the app r
 
 | Permission | Used for |
 |---|---|
-| `User.ReadWrite.All` | User create, fetch, disable, delete |
+| `User.ReadWrite.All` | User create, fetch, disable, delete, and the `memberOf` read for governance |
 | `Group.ReadWrite.All` | Group membership check and assignment |
-| `RoleManagement.ReadWrite.Directory` | Directory role (RBAC) assignment |
 | `PrivilegedAccess.ReadWrite.AzureADGroup` | PIM group eligibility assignment and removal |
-| `EntitlementManagement.ReadWrite.All` | Access Package assignment and removal |
+| `EntitlementManagement.ReadWrite.All` | Access Package assignment, removal, and reading configured incompatibilities |
 
 One gap is worth stating plainly. The Leaver's active-PIM-session termination (§3.3, ADR-016) reads `assignmentScheduleInstances` to discover live sessions, which requires an additional PIM read scope (`PrivilegedAssignmentSchedule.Read.AzureADGroup` or equivalent) that is not yet granted on the app registration. Until it is, that step returns `403` and is skipped with a warning — by design it is non-blocking, an additional control on top of package removal rather than a prerequisite for it, so offboarding still completes. Granting the scope is tracked as an outstanding item.
 
@@ -954,12 +939,13 @@ One rule governs the whole system: nothing is ever silently dropped. Every failu
 | Duplicate EventId | Exit immediately, no side effects (§6) |
 | Concurrent event, same employee | Queued FIFO, or lock-reject and exit (§6) |
 | Parse or normalization failure | Hold queue — `NormalizationFailed` → `Held` |
-| Governance validation failure | Hold queue — `ValidationFailed` → `Held` |
+| PreProvision gate failure | Hold queue — `ValidationFailed` → `Held` |
 | Graph `429` / `5xx` | Retry with backoff (§7.2) — not a failure until retries are exhausted |
 | Graph write failure after the lock | Event marked `Failed`, lock released, audit written |
+| PostProvision governance finding | Recorded in the audit record; event marked failed (Joiner) or `MOVE_PARTIAL` (Mover) — not un-granted |
 | Leaver Graph failure | Event marked `Failed` — no hold queue (§8.5) |
 
-The split is the important part. The hold queue holds records that never reached the tenant — they failed a gate, so there is nothing provisioned to clean up and a human can fix the input and release them. The `Failed` event state is for work that *passed* the gate, took a lock, and then failed mid-write. Those are two different tables and two different lifecycles, and they both mean different things by "failed": a hold record's `Failed` is a released record whose provisioning attempt broke and can be reset; an event's `Failed` (§6) is a normal event that failed after acquiring its lock. Keeping them separate keeps each meaningful.
+The split is the important part. The hold queue holds records that never reached the tenant — they failed the PreProvision gate, so there is nothing provisioned to clean up and a human can fix the input and release them. The `Failed` event state is for work that *passed* the gate, took a lock, and then failed mid-write or produced a detective finding after delivery. Those are two different tables and two different lifecycles, and they both mean different things by "failed": a hold record's `Failed` is a released record whose provisioning attempt broke and can be reset; an event's `Failed` (§6) is a normal event that failed after acquiring its lock. Keeping them separate keeps each meaningful.
 
 ### 8.2 The Hold Queue State Machine
 
@@ -987,7 +973,7 @@ stateDiagram-v2
 
 `Received → Held` directly is not a legal transition and raises a `ValueError` if attempted. A record must pass through `NormalizationFailed` or `ValidationFailed` first, because the reason a record was held is encoded in the *path it took*, not in a separate flag. A parse error is structurally a normalization failure and routes the same way. Any new entry point into the queue has to be checked against the transition map — the map is the contract, not a suggestion.
 
-**Entry is categorised on purpose.** The manager has a distinct constructor for each way in — parse error, normalization failure, validation failure — so an operator scanning the queue can tell a data-quality problem from a policy problem at a glance and route it to the right owner. A missing-manager block is fixed by correcting the HR record; a policy block needs a different remediation entirely. The manager also carries a dedicated Separation of Duties hold path that produces a separately identifiable record for the same reason, but that path is dormant today — no pipeline emits SoD violations yet (§5.4), so nothing calls it.
+**Entry is categorised on purpose.** The manager has a distinct constructor for each way in — parse error, normalization failure, PreProvision-gate failure — so an operator scanning the queue can tell a data-quality problem from a policy problem at a glance and route it to the right owner. A missing-manager block is fixed by correcting the HR record; a policy block needs a different remediation entirely. The manager also carries a dedicated Separation of Duties hold path for the future Mover pre-flight (ADR-011) — when a genuine SoD conflict blocks a Mover, it produces a separately identifiable hold record. That path is present in the design; the pre-flight that emits to it is the next build (§5.4).
 
 **Exit is deliberate and audited.** A held record leaves only by manual approval: an operator releases it, which sets a `manual_override` flag and an override note and moves it to `Approved`. That override must appear in the audit log — it is an explicit exception to policy and has to be traceable to the person who made it. From there the record runs through `Provisioning → Provisioned → Completed`. If a released record fails during provisioning it lands in `Failed`, which can be reset to `Held` for another attempt rather than being lost.
 
@@ -1005,17 +991,17 @@ Beyond routing, the pipelines are shaped so a failure does the least damage poss
 
 On the **Joiner**, a pre-gate failure holds the record; a post-lock write failure marks the event `Failed`, releases the lock, and writes an audit report. Because actions are recorded to the report as they execute, a partial failure produces a precise account of exactly what succeeded before the break — which package delivered, which one didn't.
 
-On the **Mover**, the add-before-remove ordering (ADR-009) is itself a failure-containment decision. A failed addition gates every removal, so the worst case is a user left holding *more* access than their new role needs — stale but present, and recoverable — rather than *less*, which would disrupt their work immediately. A removal failure marks the event `MOVE_FAILED` and releases the lock. (The Mover's SoD hold path to `MoverHoldQueue` exists in the same spirit, but is dormant until platform SoD is configured.)
+On the **Mover**, the add-before-remove ordering (ADR-009) is itself a failure-containment decision. A failed addition gates every removal, so the worst case is a user left holding *more* access than their new role needs — stale but present, and recoverable — rather than *less*, which would disrupt their work immediately. A removal failure marks the event `MOVE_FAILED` and releases the lock. A detective PostProvision finding produces `MOVE_PARTIAL` with the reason recorded — the move stands, the finding is surfaced. (The Mover's SoD hold path to `MoverHoldQueue` is the destination for the future ADR-011 pre-flight block; the write path exists in design, the pre-flight that drives it is the next build — §5.4, §13.)
 
 In both cases the audit record *is* the failure record. There is no separate error log to reconcile against — the report written at processing time already says what happened.
 
 ### 8.5 The Leaver Has No Hold Queue — and That Needs Sharpening
 
-The Leaver has no `LeaverHoldQueue`, and today that is a deliberate structural simplification. The Leaver has no governance gate and no SoD check — there is no pre-provision decision that could hold an event — so a failure has nowhere to be *held*; it routes straight to `Failed` on the event store.
+The Leaver has no `LeaverHoldQueue`, and today that is a deliberate structural simplification. The Leaver has no governance gate — there is no pre-provision decision that could hold an event — so a failure has nowhere to be *held*; it routes straight to `Failed` on the event store.
 
 Within a run, the Leaver is already fault-tolerant in the ways that matter most. Disable and revoke happen first (ADR-015), so even a total failure of everything downstream leaves the identity locked out. Individual package-removal failures do not stop the run — the remaining removals still execute, and Step 7 verification surfaces exactly which packages didn't clear as `OFFBOARD_PARTIAL`. A partial removal still leaves the user with less access than doing nothing would.
 
-What's missing is the *recovery* path, and this is the part to sharpen. When a Leaver fails halfway, it lands as a `Failed` event plus an `OFFBOARD_PARTIAL` audit record — but there is no first-class review-and-resume mechanism equivalent to the hold queue. Finishing a partial offboarding currently depends on either re-running the event (which `claim_event` rejects as a duplicate — the reclaim design in ADR-013 would allow this) or a Reconciliation event (ADR-012), and neither is built. So a partial Leaver is *visible* and *contained*, but not yet *recoverable* without manual intervention. A Leaver that fails at step four should have a defined path back to completion, not just a marker saying it stopped. That path is the next piece of hardening this pipeline needs.
+What's missing is the *recovery* path, and this is the part to sharpen. When a Leaver fails halfway, it lands as a `Failed` event plus an `OFFBOARD_PARTIAL` audit record — but there is no first-class review-and-resume mechanism equivalent to the hold queue. Finishing a partial offboarding currently depends on either re-running the event (which `claim_event` rejects as a duplicate — the reclaim design in ADR-013 would allow this) or a Reconciliation event (ADR-012), and neither is fully built for this path. So a partial Leaver is *visible* and *contained*, but not yet *recoverable* without manual intervention. A Leaver that fails at step four should have a defined path back to completion, not just a marker saying it stopped. That path is the next piece of hardening this pipeline needs.
 
 ### 8.6 Transient Versus Terminal
 
@@ -1031,7 +1017,7 @@ Every event produces exactly one record, written at the time of processing, rega
 
 Three properties define the contract, and they hold for every lifecycle branch:
 
-**Written regardless of outcome.** A success, a hold, and a failure all produce a report. There is no path through the engine that completes without leaving one behind.
+**Written regardless of outcome.** A success, a hold, and a failure all produce a report. There is no path through the engine that completes without leaving one behind. A detective PostProvision finding is captured in the same record as the rest of the event — it is part of the outcome, not a separate log.
 
 **Written once by the engine.** Each report is a distinct file or row with a unique, timestamped identity, and the engine's own code never rewrites it. Storage-*enforced* immutability is a further step that is planned rather than built: the intended production design writes each `DecisionReport` to a blob with `overwrite=False` in a container carrying a retention/immutability policy, so the storage layer itself refuses to overwrite a record. Today the Joiner's reports are written as local JSON files, which carry no such guarantee — §9.6 states exactly where records land now and where the immutability gap is.
 
@@ -1053,7 +1039,7 @@ The Joiner writes a `DecisionReport`, a structured document with three groups of
 | Event metadata | `event`, `timestamp` (processing start), `engine_version`, `correlation_id` (the Azure Function invocation ID, linking the report to platform logs) |
 | Outcome | `validation_status`, `normalization_status`, `actions_taken`, `warnings`, `hold_reasons`, `manual_override`, `override_note`, `hold_record_id` |
 
-Two of the status enums carry more meaning than a plain pass/fail. `validation_status` defaults to `Skipped`, and that value is load-bearing: a record held *before* validation ran is `Skipped`, not `Failed` — the report distinguishes "the gate said no" from "the record never reached the gate." Similarly `normalization_status` has a `PartialHold` value for the case where some fields resolved and others didn't. The report captures not just the verdict but where in the pipeline the verdict was reached.
+Two of the status enums carry more meaning than a plain pass/fail. `validation_status` defaults to `Skipped`, and that value is load-bearing: a record held *before* the PreProvision gate ran is `Skipped`, not `Failed` — the report distinguishes "the gate said no" from "the record never reached the gate." Similarly `normalization_status` has a `PartialHold` value for the case where some fields resolved and others didn't. The report captures not just the verdict but where in the pipeline the verdict was reached.
 
 Storage is one file per event: `{employee_id}_{event}_{timestamp}.json`, written to the output directory as local JSON — this is what runs today, in both local and deployed execution. The planned production form writes the same document to a blob under `reports/{year}/{month}/` with `overwrite=False` and an immutability policy (§9.6, §11); that blob path is not yet wired. The filename is unique and time-sortable by construction, so reports never collide and a directory listing browses in chronological order.
 
@@ -1075,12 +1061,12 @@ The **Mover audit record** (to `MoverAuditLog`) carries:
 | `packages_retained` | Each with `retention_reason` and `review_date` |
 | `packages_added` | Package IDs that reached Delivered |
 | `packages_removed` | Each with a reason code (`ROLE_CHANGE`) |
-| `sod_evaluation` | Currently `"SoDEvaluationSkipped-ADR008"` — reserved for platform SoD |
-| `sod_escalations` | Currently empty — reserved for future SoD warnings |
-| `post_move_verification` | `status`, `discrepancies`, `governance_passed`, `governance_warnings` |
+| `post_move_verification` | `status`, `discrepancies`, `governance_passed`, `governance_failures`, `governance_warnings` |
 | `actions_taken` | Ordered list of per-package actions with `action`, `package_id`, `detail`, `succeeded` |
 | `warnings` | Non-blocking issues (failed attribute patch, ADR-009 deferral, etc.) |
 | `post_move_status` | Terminal: `MOVE_SUCCESS` / `MOVE_PARTIAL` / `MOVE_FAILED` |
+
+The `post_move_verification.governance_failures` field carries the detective PostProvision reasons (employment/tier violations) and `governance_warnings` the recorded SoD conflicts, so a `MOVE_PARTIAL` names exactly what was found.
 
 The **Leaver audit record** (to `LeaverAuditLog`) carries:
 
@@ -1108,7 +1094,7 @@ The summary is deliberately *not* authoritative. It is additive: it never replac
 
 The audit layer spans two storage models, and it is worth being exact about what is deployed and what is not. The Mover and Leaver records are written to **Azure Table Storage** (`MoverAuditLog`, `LeaverAuditLog`) — real, deployed storage. The Joiner's `DecisionReport` documents are written as **local JSON files** today; the planned production form is a blob, time-partitioned under `reports/{year}/{month}/`, written `overwrite=False` in a container with an immutability policy.
 
-Neither model is storage-immutable yet. Table rows are technically updatable, and the Joiner reports are ordinary files. "Written once" is therefore an engine-side discipline — the code writes each record once and never rewrites it — not a guarantee the storage layer enforces. Closing that gap is a specific planned item (§11): move Joiner reports to write-once blob storage with a retention policy, and treat the audit tables as append-only under the same policy regime. Until then, the audit trail is complete and produced at processing time, but its immutability rests on the engine's behaviour rather than on the storage platform refusing to overwrite.
+Neither model is storage-immutable yet. Table rows are technically updatable, and the Joiner reports are ordinary files. "Written once" is therefore an engine-side discipline — the code writes each record once and never rewrites it — not a guarantee the storage layer enforces. The one deliberate exception is the Leaver's deferred-delete completion (§3.3.15), which makes a single confined update to its own audit row when the delayed deletion finishes; that is a documented, scoped exception, not a general rewrite. Closing the immutability gap is a specific planned item (§11): move Joiner reports to write-once blob storage with a retention policy, and treat the audit tables as append-only under the same policy regime. Until then, the audit trail is complete and produced at processing time, but its immutability rests on the engine's behaviour rather than on the storage platform refusing to overwrite.
 
 The `correlation_id` on each report ties it to Azure Function platform logs, and the run summary's `correlation_id` ties it back to the individual event reports, so the three layers — platform log, event report, run summary — cross-reference rather than duplicate.
 
@@ -1155,14 +1141,14 @@ flowchart LR
     RAW["Raw HR record<br/>source fields"] --> CANON["IdentityPayload<br/>canonical identity"]
     CANON --> RES["EntitlementResult<br/>resolved Access Packages"]
     RES --> REQ["Assignment requests<br/>adminAdd / adminRemove"]
-    REQ --> STATE["Verified tenant state<br/>delivered assignments"]
+    REQ --> STATE["Verified tenant state<br/>delivered assignments + memberOf"]
     STATE --> REC["Audit record<br/>DecisionReport / Mover / Leaver"]
 
     style CANON fill:#E9F1FB,color:#16244A
     style REC fill:#E9F1FB,color:#16244A
 ```
 
-Each arrow is a component boundary, and each box is a data contract owned by one layer. The raw record is source-shaped. The canonical identity is engine-shaped. The entitlement result is a set of package assignments, each tagged with its rule ID. The assignment requests are Graph-shaped. The verified state is what the tenant actually returned. And the audit record is the written account of the whole journey. A Leaver's path is shorter — it skips the resolution and delta boxes and moves from current state straight to removal requests — but it ends in the same audit contract.
+Each arrow is a component boundary, and each box is a data contract owned by one layer. The raw record is source-shaped. The canonical identity is engine-shaped. The entitlement result is a set of package assignments, each tagged with its rule ID. The assignment requests are Graph-shaped. The verified state is what the tenant actually returned — delivered assignments for verification, and `memberOf` for the detective governance check. And the audit record is the written account of the whole journey. A Leaver's path is shorter — it skips the resolution and delta boxes and moves from current state straight to removal requests — but it ends in the same audit contract.
 
 ### 10.5 Where Records Leave the Flow
 
@@ -1188,17 +1174,23 @@ The engine is deployed to Azure and runs there today, on an Azure Functions app 
 
 - **Table Storage in Azure.** The engine's operational tables — `JmlEvents`, the hold queue, the Mover and Leaver event and audit logs, `RetentionRegistry` — live in the deployed storage account, partitioned as §6 and §8 describe.
 
-- **Durable Functions runtime for all three pipelines.** The Joiner's provisioning runs as a Durable orchestration: user creation, a user-propagation timer, package submission, a check-and-timer delivery-poll loop, then record-and-finalize (§7.8). The Mover runs the same way with two poll loops — additions then removals — and the ADR-009 add-before-remove gate as an orchestrator branch between them (§3.2.13). The Leaver runs a single removal poll loop with no gate, disable-and-revoke in the pre-removal activity, and a deferred-delete timer for a nonzero soft-delete hold (§3.3.15). In every case the waits that were blocking `time.sleep` calls are orchestrator timers, so a long delivery or removal completes instead of hitting the gateway timeout.
+- **In-process governance.** The PreProvision gate and the detective PostProvision check run inside the engine (ADR-019) — pure functions read from `governance_model.json` and the group-anchored SoD catalogue, called identically from the synchronous and durable paths. Proven on the live tenant: a bad payload blocked before any write, and a seeded direct-assignment conflict detected and recorded post-delivery.
+
+- **Platform Separation of Duties.** Access-package incompatibility relationships are configured in Entra and proven — a conflicting assignment is denied at request time and the denial surfaces to the engine through the existing polling.
+
+- **Durable Functions runtime for all three pipelines.** The Joiner, Mover, and Leaver all run as Durable orchestrations with timer-driven polling; the Mover has two poll loops with the ADR-009 gate between them, the Leaver one loop with a deferred-delete timer. In every case the waits that were blocking `time.sleep` calls are orchestrator timers, so a long delivery or removal completes instead of hitting the gateway timeout.
 
 ### 11.2 Remaining
+
+- **Mover pre-flight blocking SoD (ADR-011).** Query Entra's configured incompatibilities before submitting adds; reorder (remove-first) for a legitimate transition, block a genuine conflict. The next governance build.
 
 - **Managed Identity authentication.** Authentication is still `ClientSecretCredential` in both local and deployed environments. The planned change replaces it with a Managed Identity credential for all Graph and Azure Storage access; because the credential is constructed in one place per client, the swap is confined to those points (§7.1).
 
 - **Blob Storage for audit reports (immutability).** Joiner `DecisionReport` documents are written as local JSON today. The planned form writes them to a blob container under `reports/{year}/{month}/` with `overwrite=False` and an immutability/retention policy, so audit records cannot be altered or deleted — closing the gap §9.6 describes.
 
-- **Validation engine reintegration.** The PowerShell governance validation engine is decoupled and skipped in current runs via `JML_SKIP_VALIDATION_ENGINE=true` (§5.3). Reintegration is deploying it as its own function app and turning the gate back on; the HTTP contract between the two is already stable.
+- **Standalone Validation Engine as continuous evaluation.** The PowerShell validation engine is descoped to standalone, tenant-wide, continuous scanning (FullScan/DriftOnly — RBAC, cross-plane, MFA, hygiene, inactivity, drift). Scheduling it as a continuous control against the reconciled catalogue is planned; it is a separate product from the in-engine gate, not a runtime dependency.
 
-- **Config in Azure Storage.** Host the policy files — `canonical_lookup.json`, `role_mapping_rules.json`, and the governance rule set — in Azure Storage so policy updates need no redeployment, which is already how the engine loads them.
+- **Config in Azure Storage.** Host the policy files — `canonical_lookup.json`, `role_mapping_rules.json`, `governance_model.json`, and the SoD catalogue — in Azure Storage so policy updates need no redeployment, which is already how the engine loads them.
 
 - **Secrets in Key Vault.** App settings currently hold configuration and the client secret; moving secrets to Key Vault is part of the same hardening as Managed Identity.
 
@@ -1217,6 +1209,8 @@ Honest architecture states what it does and what it does not. This section is th
 - Provisions **Joiner, Mover, and Leaver** events against a live Entra ID tenant, all through Entitlement Management Access Packages rather than direct group assignment (ADR-007).
 - Resolves entitlements from an **externally configurable policy** — JSON rules, changeable without redeploying the engine — with every grant traceable to a rule ID.
 - Processes events **deterministically and idempotently**: a deterministic event ID, an atomic claim, a concurrency lock, a FIFO conflict queue, and a Leaver supersede that cancels pending Joiner/Mover events for a terminated employee.
+- **Runs an in-process PreProvision governance gate (preventive, blocks)** — attribute-only, zero Graph, before any write — and an **in-process PostProvision check (detective, records)** that reads real `memberOf` after delivery and captures employment/tier and SoD findings without blocking (ADR-019).
+- **Enforces preventive Separation of Duties at the platform** — Entra access-package incompatibility relationships are configured and proven; a conflicting assignment is denied at request time on any provisioning path (ADR-008).
 - Applies **safe ordering** per lifecycle: add-before-remove on the Mover (ADR-009) so a transition never drops access, and disable-and-revoke-before-remove on the Leaver (ADR-015) so a partial offboarding still fails safe.
 - Reads **time-bounded retention records** to exclude specific packages from removal on a Mover, and **detects unmanaged packages** so access the engine didn't assign is left untouched on a Mover and removed on a Leaver.
 - **Verifies real tenant state** after every run — not just the Graph API response — and terminates active PIM sessions on offboarding (ADR-016).
@@ -1230,13 +1224,15 @@ Honest architecture states what it does and what it does not. This section is th
 
 ### 12.2 What the Engine Does Not Do
 
-- **Enforce Separation of Duties.** No pipeline runs an SoD check today. It is planned as platform-level enforcement in Entra Entitlement Management (ADR-008), not yet configured (§5.4).
-- **Run the governance validation gate.** The gate is currently decoupled and skipped in current runs; it is reintegrated once the PowerShell validation engine is itself deployed (§5.3, §11).
+- **Block Separation of Duties on a Mover before the write.** Preventive SoD is enforced at the platform (denial at request time) and detected post-delivery, but the Mover pre-flight (ADR-011) that queries incompatibility ahead of the submit — to reorder or block a genuine conflict in-engine — is the next build, not yet done (§5.4).
+- **Remediate a detected conflict.** PostProvision *records* an SoD or employment/tier finding; it does not remove the offending access. Removing access already granted is the reconciliation pipeline's job (ADR-012), unbuilt (§5.3, §13).
 - **Authenticate with Managed Identity.** Both environments still use Microsoft Graph client credentials; Managed Identity and Key Vault secrets are planned (§7.1, §11).
 - **Store audit records immutably.** Records are written once by the engine, but Joiner reports are local JSON and the audit tables are updatable — storage-enforced immutability (write-once blob with a retention policy) is planned (§9.6, §11).
-- **Recover a partially failed Leaver.** A partial offboarding is visible and contained but not yet recoverable without manual intervention — there is no hold-queue equivalent, and the reclaim (ADR-013) and reconciliation (ADR-012) paths that would resume it are unbuilt (§8.5).
+- **Recover a partially failed Leaver.** A partial offboarding is visible and contained but not yet recoverable without manual intervention — there is no hold-queue equivalent, and the reclaim (ADR-013) and reconciliation (ADR-012) paths that would resume it are not fully built (§8.5).
+- **Offer a reviewable Mover hold queue.** The `MoverHoldQueue` write path is designed for the ADR-011 pre-flight block, but the release/resume lifecycle (re-deriving a transition against changed state) is not built.
 - **Write to the retention registry.** The engine reads `RetentionRegistry` but does not populate it — that requires an access request workflow. Entries are created manually today.
 - **Patch every attribute.** `usageLocation` (needs an ISO country code; the HR source sends city names) and `manager` (needs a separate Graph endpoint) are tracked but excluded from the write.
+- **Run tenant-wide continuous scanning inside the engine.** RBAC, cross-plane, MFA, hygiene, and inactivity checks are out of scope for the in-engine gate by design; they are the standalone Validation Engine's job (§2.3, §4.4).
 - **Provision downstream through its own SCIM connector.** Downstream fan-out today is Entra-driven — package assignment triggers Entra's SCIM provisioning to AWS IAM Identity Center and its M365 group delivery to Teams/SharePoint (§12.1). What the engine does *not* do is own a SCIM connector of its own to arbitrary SaaS targets; that broader fan-out is future work (§13).
 - **Ingest HR events by push.** Only delta polling and CSV exist; webhook ingestion is planned (§11).
 - **Run PIM without P2**, and the Leaver's active-session termination additionally needs a PIM read scope not yet granted, so that step is skipped with a warning until the grant is in place (§7.9).
@@ -1245,16 +1241,18 @@ Honest architecture states what it does and what it does not. This section is th
 
 ## 13. Future Evolution (Planned)
 
-Section 11 covers getting the current engine deployed. This section covers capabilities the engine does not yet have, in a rough order of dependency. None of these is built.
+Section 11 covers getting the current engine hardened. This section covers capabilities the engine does not yet have, in a rough order of dependency.
 
-- **Platform Separation of Duties (ADR-008, ADR-011).** Configure access-package incompatibility relationships in Entra so conflicting assignments are rejected at the platform, surfacing as a `Denied` request through the existing polling. Then build the pre-flight incompatibility check (ADR-011) that queries Entra's configured incompatibilities before submitting, so the engine can choose add-first or remove-first per package rather than always assuming add-first is safe.
+- **Mover pre-flight blocking SoD (ADR-011).** The next build. Query Entra's configured incompatibilities before submitting adds; choose add-first, remove-first (a legitimate incompatible transition), or block a genuine conflict — so the engine plans around the constraint rather than reacting to a platform rejection. The durable Mover's op-generic activities already host the remove-first branch; the pre-flight query and the block-to-`MoverHoldQueue` write are what remain.
 
-- **Reconciliation pipeline (ADR-012).** A fourth event type — already reserved in the audit schema (§9) — that scans for drift between policy and actual tenant state and repairs it. This is also the mechanism that completes deferred and partially failed work, which is why the Leaver's recovery gap depends on it.
+- **Reconciliation pipeline (ADR-012).** A fourth event type — already reserved in the audit schema (§9) — that scans for drift between policy and actual tenant state and repairs it. This is the home for *remediation* of a detected conflict (removing access PostProvision only records), and the mechanism that completes deferred and partially failed work, which is why the Leaver's recovery gap depends on it.
 
-- **Event store reclaim for failed events (ADR-013).** Allow a `Failed` or deferred event to be re-run rather than rejected as a duplicate by `claim_event`. This is the small primitive that unblocks two larger things: finishing a deferred Leaver soft-delete, and resuming a partially failed offboarding without manual surgery (§8.5).
+- **Event store reclaim for failed events (ADR-013).** Allow a `Failed` or deferred event to be re-run rather than rejected as a duplicate by `claim_event`. This is the small primitive that unblocks two larger things: finishing a deferred Leaver soft-delete, and resuming a partially failed offboarding or a held-then-corrected Mover without manual surgery (§8.5).
+
+- **Reviewable Mover hold lifecycle.** Build the release/resume path for a Mover blocked by the ADR-011 pre-flight — re-deriving the transition against current tenant state on release. Shares the resume-on-changed-state problem with the Leaver recovery path and reconciliation.
+
+- **Standalone Validation Engine as continuous evaluation.** Schedule the descoped PowerShell scanner as a continuous, tenant-wide detective control (RBAC, cross-plane, MFA, hygiene, inactivity, drift) against the reconciled catalogue — the layer that catches what the per-event in-engine checks cannot see because they are scoped to one identity.
 
 - **Approval and request workflows.** An access request workflow that both gates provisioning behind approval and, critically, **populates the retention registry** the Mover already reads from — closing the loop so retention records are created by a governed process rather than by hand.
 
 - **Engine-owned SCIM to further SaaS targets.** Downstream fan-out already works for the targets wired through Entra — package assignment provisions AWS IAM Identity Center over SCIM and delivers Teams/SharePoint through M365 groups, all automatically (§12.1). The future step is extending that reach to SaaS applications not driven by an Entra-native connector, still keeping Entra as the single control plane and provisioning via SCIM so there is one governed source of truth and one audit trail rather than a parallel provisioning path. (Salesforce is the first candidate target.)
-
-- **A first-class Leaver recovery path.** Building on reclaim (ADR-013) and reconciliation (ADR-012), give a Leaver that fails partway a defined route back to completion — the hardening §8.5 identifies as the pipeline's next real gap.

@@ -31,8 +31,10 @@ from Functions.Event_store.event_store import (
 from Mover.stage_result import StageOutcome
 from Mover.stages import (
     stage_claim, stage_concurrent_check, stage_fetch_current_state,
-    stage_resolve, stage_delta, stage_retention, stage_verify,
+    stage_resolve, stage_delta, stage_retention, stage_preflight_sod,
+    stage_verify,
 )
+from Hold_queue.queue_manager import HoldQueueManager, InMemoryHoldQueueStore
 from Mover.provisioning_phases import (
     PendingPackage,
     submit_additions, submit_removals,
@@ -202,8 +204,41 @@ def pre(state: dict) -> dict:
     audit_record["retention_decisions"] = retention.data["audit_retention_decisions"]
     audit_record["retention_summary"]   = retention.data["audit_retention_summary"]
 
-    # Step 5 — SoD skipped (ADR-008)
-    audit_record["sod_evaluation"]  = "SoDEvaluationSkipped-ADR008"
+    # Step 5 — pre-flight SoD (ADR-020)
+    keep_set = (
+        set(delta.data["unchanged"])
+        | set(retention.data["retain_set"])
+        | set(delta.data["unmanaged"])
+    )
+    preflight = stage_preflight_sod(
+        delta.data["groups_to_add"],
+        retention.data["remove_confirmed"],
+        keep_set,
+        graph_client,
+        resolve.data["package_labels"],
+    )
+    audit_record["sod_evaluation"] = preflight.data.get("decisions", {})
+
+    if preflight.outcome == StageOutcome.HELD:
+        audit_record["warnings"].extend(preflight.hold_reasons)
+        audit_record["sod_escalations"] = preflight.data["blocked_packages"]
+
+        hold_manager = HoldQueueManager(InMemoryHoldQueueStore())
+        hold_manager.create_from_sod_block(payload, preflight.data["blocked_packages"])
+
+        _write_event_log(table_client, employee_id, event_id, "SOD_HELD")
+        _write_audit_record(table_client, employee_id, event_id, audit_record)
+        release_lock(jml_events_client, employee_id, event_id)
+        update_event_status(
+            table_client=jml_events_client, employee_id=employee_id,
+            event_id=event_id, status=EventStatus.FAILED,
+            failure_step="PreFlightSoD",
+        )
+        return {
+            "final_status": "SOD_HELD", "employee_id": employee_id,
+            "event_id": event_id, "summary": preflight.summary,
+        }
+
     audit_record["sod_escalations"] = []
 
     return {
@@ -222,6 +257,7 @@ def pre(state: dict) -> dict:
         "remove_confirmed":   retention.data["remove_confirmed"],
         "retain_set":         retention.data["retain_set"],
         "retention_applied":  retention.data["retention_applied"],
+        "reorder":            preflight.data.get("reorder", False),
         "audit_record":       audit_record,
     }
 

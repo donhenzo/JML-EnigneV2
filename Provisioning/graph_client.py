@@ -529,132 +529,132 @@ class JmlGraphClient:
                 status_code=status_code,
             )
 
-        @retry_on_throttle(max_retries=3, base_backoff=2.0)
-        def get_group(self, group_id: str) -> dict:
-            """
-            Retrieve a group by object ID.
+    @retry_on_throttle(max_retries=3, base_backoff=2.0)
+    def get_group(self, group_id: str) -> dict:
+        """
+        Retrieve a group by object ID.
 
-            Returns group details including is_dynamic — the provisioner uses
-            this to skip manual membership assignment for dynamic groups.
+        Returns group details including is_dynamic — the provisioner uses
+        this to skip manual membership assignment for dynamic groups.
 
-            Raises GraphClientError with status_code set.
-            """
-            try:
-                group = self._run(self._client.groups.by_group_id(group_id).get())
+        Raises GraphClientError with status_code set.
+        """
+        try:
+            group = self._run(self._client.groups.by_group_id(group_id).get())
 
-                if group is None:
-                    raise GraphClientError(f"Group not found: {group_id}", status_code=404)
+            if group is None:
+                raise GraphClientError(f"Group not found: {group_id}", status_code=404)
 
-                return {
-                    "id":              group.id,
-                    "display_name":    group.display_name,
-                    "membership_rule": group.membership_rule,
-                    "is_dynamic":      bool(group.membership_rule),
-                }
+            return {
+                "id":              group.id,
+                "display_name":    group.display_name,
+                "membership_rule": group.membership_rule,
+                "is_dynamic":      bool(group.membership_rule),
+            }
 
-            except GraphClientError:
-                raise
-            except Exception as e:
-                status_code = _extract_status_code(e)
-                raise GraphClientError(
-                    f"get_group failed for {group_id}: {e}",
-                    status_code=status_code
-                )
+        except GraphClientError:
+            raise
+        except Exception as e:
+            status_code = _extract_status_code(e)
+            raise GraphClientError(
+                f"get_group failed for {group_id}: {e}",
+                status_code=status_code
+            )
 
-        @retry_on_throttle(max_retries=3, base_backoff=2.0)
-        def check_group_membership(self, user_id: str, group_id: str) -> bool:
-            """
-            Return True if the user is already a member of the group.
+    @retry_on_throttle(max_retries=3, base_backoff=2.0)
+    def check_group_membership(self, user_id: str, group_id: str) -> bool:
+        """
+        Return True if the user is already a member of the group.
 
-            Always called before add_group_member() to keep assignment idempotent.
-            Raises GraphClientError with status_code set.
-            """
-            try:
-                members = self._run(
-                    self._client.groups.by_group_id(group_id).members.get()
-                )
+        Always called before add_group_member() to keep assignment idempotent.
+        Raises GraphClientError with status_code set.
+        """
+        try:
+            members = self._run(
+                self._client.groups.by_group_id(group_id).members.get()
+            )
 
-                if members and members.value:
-                    for member in members.value:
-                        if member.id == user_id:
-                            return True
-                return False
+            if members and members.value:
+                for member in members.value:
+                    if member.id == user_id:
+                        return True
+            return False
 
-            except GraphClientError:
-                raise
-            except Exception as e:
-                status_code = _extract_status_code(e)
-                raise GraphClientError(
-                    f"check_group_membership failed — user={user_id}, group={group_id}: {e}",
-                    status_code=status_code
-                )
+        except GraphClientError:
+            raise
+        except Exception as e:
+            status_code = _extract_status_code(e)
+            raise GraphClientError(
+                f"check_group_membership failed — user={user_id}, group={group_id}: {e}",
+                status_code=status_code
+            )
 
-        @retry_on_throttle(max_retries=3, base_backoff=2.0)
-        def add_group_member(self, user_id: str, group_id: str) -> None:
-            """
-            Add a user to an Entra ID group.
+    @retry_on_throttle(max_retries=3, base_backoff=2.0)
+    def add_group_member(self, user_id: str, group_id: str) -> None:
+        """
+        Add a user to an Entra ID group.
 
-            Only called after check_group_membership() confirms the user is
-            not already a member. Does not guard against duplicates itself.
-            Raises GraphClientError with status_code set.
-            """
-            try:
-                ref          = ReferenceCreate()
-                ref.odata_id = (
-                    f"https://graph.microsoft.com/v1.0/directoryObjects/{user_id}"
-                )
+        Only called after check_group_membership() confirms the user is
+        not already a member. Does not guard against duplicates itself.
+        Raises GraphClientError with status_code set.
+        """
+        try:
+            ref          = ReferenceCreate()
+            ref.odata_id = (
+                f"https://graph.microsoft.com/v1.0/directoryObjects/{user_id}"
+            )
 
-                self._run(
-                    self._client.groups.by_group_id(group_id).members.ref.post(ref)
-                )
+            self._run(
+                self._client.groups.by_group_id(group_id).members.ref.post(ref)
+            )
 
-                logger.info(f"Group member added — user={user_id}, group={group_id}")
+            logger.info(f"Group member added — user={user_id}, group={group_id}")
 
-            except GraphClientError:
-                raise
-            except Exception as e:
-                status_code = _extract_status_code(e)
-                raise GraphClientError(
-                    f"add_group_member failed — user={user_id}, group={group_id}: {e}",
-                    status_code=status_code
-                )
+        except GraphClientError:
+            raise
+        except Exception as e:
+            status_code = _extract_status_code(e)
+            raise GraphClientError(
+                f"add_group_member failed — user={user_id}, group={group_id}: {e}",
+                status_code=status_code
+            )
 
-        @retry_on_throttle(max_retries=3, base_backoff=2.0)
-        def check_rbac_assignment(
-            self,
-            user_id: str,
-            role_definition_id: str,
-            scope: str
-        ) -> bool:
-            """
-            Return True if the RBAC role assignment already exists for this user.
+    @retry_on_throttle(max_retries=3, base_backoff=2.0)
+    def check_rbac_assignment(
+        self,
+        user_id: str,
+        role_definition_id: str,
+        scope: str
+    ) -> bool:
+        """
+        Return True if the RBAC role assignment already exists for this user.
 
-            Always called before create_rbac_assignment() to prevent duplicate
-            assignments on retry.
-            Raises GraphClientError with status_code set.
-            """
-            try:
-                assignments = self._run(
-                    self._client.role_management.directory.role_assignments.get()
-                )
+        Always called before create_rbac_assignment() to prevent duplicate
+        assignments on retry.
+        Raises GraphClientError with status_code set.
+        """
+        try:
+            assignments = self._run(
+                self._client.role_management.directory.role_assignments.get()
+            )
 
-                if assignments and assignments.value:
-                    for assignment in assignments.value:
-                        if (
-                            assignment.principal_id       == user_id
-                            and assignment.role_definition_id == role_definition_id
-                        ):
-                            return True
-                return False
+            if assignments and assignments.value:
+                for assignment in assignments.value:
+                    if (
+                        assignment.principal_id       == user_id
+                        and assignment.role_definition_id == role_definition_id
+                    ):
+                        return True
+            return False
 
-            except GraphClientError:
-                raise
-            except Exception as e:
-                status_code = _extract_status_code(e)
-                raise GraphClientError(
-                    f"check_rbac_assignment failed — user={user_id}: {e}",
-                    status_code=status_code
-                )
+        except GraphClientError:
+            raise
+        except Exception as e:
+            status_code = _extract_status_code(e)
+            raise GraphClientError(
+                f"check_rbac_assignment failed — user={user_id}: {e}",
+                status_code=status_code
+            )
 
     @retry_on_throttle(max_retries=3, base_backoff=2.0)
     def create_rbac_assignment(
@@ -1284,6 +1284,65 @@ class JmlGraphClient:
                 status_code=status_code,
             )
 
+    @retry_on_throttle(max_retries=3, base_backoff=2.0)
+    def get_package_incompatibilities(self, package_id: str) -> set[str]:
+        """
+        Fetch the set of access-package IDs that are incompatible with the
+        given package, as configured in Entra Entitlement Management.
+
+        Used by the Mover pre-flight SoD gate (ADR-020). Queries the live
+        platform incompatibility configuration — this is the preventive
+        source of truth, distinct from the detective sod_policies.json
+        catalogue.
+
+        Returns a set of package IDs (strings). An empty set means no
+        incompatibilities are configured for this package.
+
+        Raises GraphClientError with status_code set.
+        """
+        import httpx
+
+        if self._credential is None:
+            raise GraphClientError(
+                "No credential available for get_package_incompatibilities HTTP call. "
+                "Ensure JmlGraphClient is constructed via build_graph_client()."
+            )
+
+        endpoint = (
+            f"https://graph.microsoft.com/v1.0/identityGovernance"
+            f"/entitlementManagement/accessPackages/{package_id}"
+            f"?$expand=incompatibleAccessPackages($select=id)"
+            f"&$select=id"
+        )
+
+        try:
+            token = self._credential.get_token("https://graph.microsoft.com/.default")
+
+            response = httpx.get(
+                endpoint,
+                headers={"Authorization": f"Bearer {token.token}"},
+                timeout=30,
+            )
+
+            if response.status_code != 200:
+                raise GraphClientError(
+                    f"get_package_incompatibilities failed for {package_id} — "
+                    f"status={response.status_code}, body={response.text[:300]}",
+                    status_code=response.status_code,
+                )
+
+            body = response.json()
+            incompatible = body.get("incompatibleAccessPackages", [])
+            return {item["id"] for item in incompatible if "id" in item}
+
+        except GraphClientError:
+            raise
+        except Exception as e:
+            status_code = _extract_status_code(e)
+            raise GraphClientError(
+                f"get_package_incompatibilities failed for {package_id}: {e}",
+                status_code=status_code,
+            )
 
     @retry_on_throttle(max_retries=3, base_backoff=2.0)
     def disable_user(self, user_id: str) -> None:

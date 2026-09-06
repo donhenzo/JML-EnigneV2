@@ -25,7 +25,8 @@ Processing flow (unchanged from the pre-refactor pipeline):
     Step 2    — new/old entitlement resolution (stage_resolve).
     Step 3    — package + attribute delta (stage_delta).
     Step 4    — retention evaluation (stage_retention).
-    Step 5    — SoD skipped (ADR-008); driver writes the audit constants.
+    Step 5    — Pre-flight SoD (ADR-020). BLOCK → hold queue + exit.
+                REMOVE_FIRST → reorder Steps 6/7 to remove-before-add.
     Step 6    — additions: submit → poll loop (time.sleep) → finalize.
     Step 7    — removals + attribute PATCH, gated on Step 6 all-delivered
                 (ADR-009). Same submit → poll → finalize shape.
@@ -59,8 +60,10 @@ from Mover.stages import (
     stage_resolve,
     stage_delta,
     stage_retention,
+    stage_preflight_sod,
     stage_verify,
 )
+from Hold_queue.queue_manager import HoldQueueManager, InMemoryHoldQueueStore
 from Mover.provisioning_phases import (
     PendingPackage,
     submit_additions,
@@ -101,6 +104,7 @@ class MoverEventStatus:
     MOVE_PARTIAL      = "MOVE_PARTIAL"
     MOVE_FAILED       = "MOVE_FAILED"
     QUEUED_CONCURRENT = "QUEUED_CONCURRENT"
+    SOD_HELD          = "SOD_HELD"
 
 
 # Table Storage helpers
@@ -367,43 +371,60 @@ def run_mover_pipeline(
             "Step 4 complete — %d retained, %d expired, %d no-record, %d confirmed for removal",
             summary["retained"], summary["expired"], summary["no_record"], summary["removed"],
         )
-    # Step 6 — additions (submit → poll loop → finalize)
-    logger.info("Mover Step 6 — access package additions — employee=%s", employee_id)
 
-    add_pending = submit_additions(
-        graph_client, user_id, frozenset(groups_to_add), new_policy_map, package_labels
-    )
-    _poll_until_terminal(add_pending, graph_client)
-    addition_actions, delivered_additions, additions_all_succeeded = finalize_additions(
-        graph_client, user_id, add_pending, frozenset(groups_to_add)
-    )
-    audit_record["actions_taken"].extend(addition_actions)
-    audit_record["packages_added"] = [
-        {"id": a["package_id"]} for a in addition_actions if a["succeeded"]
-    ]
+    # Step 5 — pre-flight SoD (ADR-020)
+    logger.info("Mover Step 5 — pre-flight SoD check — employee=%s", employee_id)
 
-    if not groups_to_add:
-        logger.info("Step 6 — no packages to add for this transition — employee=%s", employee_id)
-    elif additions_all_succeeded:
+    keep_set = set(unchanged) | set(retain_set) | set(unmanaged)
+    preflight = stage_preflight_sod(
+        groups_to_add, remove_confirmed, keep_set, graph_client, package_labels,
+    )
+    audit_record["sod_evaluation"] = preflight.data.get("decisions", {})
+
+    if preflight.outcome == StageOutcome.HELD:
+        # BLOCK — at least one package conflicts with a kept package.
+        audit_record["warnings"].extend(preflight.hold_reasons)
+        audit_record["sod_escalations"] = preflight.data["blocked_packages"]
+
+        hold_manager = HoldQueueManager(InMemoryHoldQueueStore())
+        hold_manager.create_from_sod_block(payload, preflight.data["blocked_packages"])
+
+        _write_event_log(table_client, employee_id, event_id, MoverEventStatus.SOD_HELD)
+        _write_audit_record(table_client, employee_id, event_id, audit_record)
+
+        release_lock(jml_events_client, employee_id, event_id)
+        update_event_status(
+            table_client=jml_events_client, employee_id=employee_id,
+            event_id=event_id, status=EventStatus.FAILED,
+            failure_step="PreFlightSoD",
+        )
+
+        return {
+            "final_status": MoverEventStatus.SOD_HELD,
+            "employee_id":  employee_id,
+            "event_id":     event_id,
+            "summary":      preflight.summary,
+        }
+
+    reorder = preflight.data.get("reorder", False)
+    if reorder:
         logger.info(
-            "Step 6 — all %d addition(s) delivered — employee=%s",
-            len(groups_to_add), employee_id,
-        )
-    else:
-        audit_record["warnings"].append(
-            "One or more package additions did not deliver — removals skipped "
-            "this pass per ADR-009 (never remove old access before new access "
-            "is confirmed). See actions_taken for which package(s) failed."
-        )
-        logger.warning(
-            "Step 6 — not all additions delivered — removals skipped this pass — employee=%s",
+            "Step 5 — REMOVE_FIRST detected, reordering to remove-before-add (ADR-011 Strategy B) — employee=%s",
             employee_id,
         )
+    else:
+        logger.info("Step 5 — no SoD conflicts, proceeding normally — employee=%s", employee_id)
 
-    # Step 7 — removals + attribute PATCH, gated on ADR-009
-    logger.info("Mover Step 7 — access package removals — employee=%s", employee_id)
+    audit_record["sod_escalations"] = []
 
-    if additions_all_succeeded:
+    # Step 6 / 7 — provisioning. Order depends on pre-flight result.
+    # Default (ADR-009): add-before-remove.
+    # REMOVE_FIRST (ADR-011 Strategy B): remove-before-add.
+
+    if reorder:
+        # REMOVE_FIRST path: removals first, then additions.
+        logger.info("Mover Step 6 (reordered) — removals first — employee=%s", employee_id)
+
         remove_pending = submit_removals(
             graph_client, user_id, frozenset(remove_confirmed),
             current_policy_map, package_labels,
@@ -421,20 +442,96 @@ def run_mover_pipeline(
             a["package_id"] for a in removal_actions if a["succeeded"]
         ]
 
+        logger.info("Mover Step 7 (reordered) — additions — employee=%s", employee_id)
+
+        add_pending = submit_additions(
+            graph_client, user_id, frozenset(groups_to_add), new_policy_map, package_labels
+        )
+        _poll_until_terminal(add_pending, graph_client)
+        addition_actions, delivered_additions, additions_all_succeeded = finalize_additions(
+            graph_client, user_id, add_pending, frozenset(groups_to_add)
+        )
+        audit_record["actions_taken"].extend(addition_actions)
+        audit_record["packages_added"] = [
+            {"id": a["package_id"]} for a in addition_actions if a["succeeded"]
+        ]
+
+        # Attribute update runs after both sides complete.
         attr_succeeded, attr_error = apply_attribute_update(
             graph_client, user_id, patch_dict
         )
         if not attr_succeeded:
             audit_record["warnings"].append(f"Attribute update failed: {attr_error}")
+
     else:
-        audit_record["packages_removed"] = []
-        recently_removed = []
-        audit_record["warnings"].append(
-            "Attribute update deferred — package additions did not all deliver, "
-            "so the role transition is not committed this pass (ADR-009). "
-            "Department/title remain at their previous values until a retry "
-            "lands every addition."
+        # Step 6 — additions (submit → poll loop → finalize)
+        logger.info("Mover Step 6 — access package additions — employee=%s", employee_id)
+
+        add_pending = submit_additions(
+            graph_client, user_id, frozenset(groups_to_add), new_policy_map, package_labels
         )
+        _poll_until_terminal(add_pending, graph_client)
+        addition_actions, delivered_additions, additions_all_succeeded = finalize_additions(
+            graph_client, user_id, add_pending, frozenset(groups_to_add)
+        )
+        audit_record["actions_taken"].extend(addition_actions)
+        audit_record["packages_added"] = [
+            {"id": a["package_id"]} for a in addition_actions if a["succeeded"]
+        ]
+
+        if not groups_to_add:
+            logger.info("Step 6 — no packages to add for this transition — employee=%s", employee_id)
+        elif additions_all_succeeded:
+            logger.info(
+                "Step 6 — all %d addition(s) delivered — employee=%s",
+                len(groups_to_add), employee_id,
+            )
+        else:
+            audit_record["warnings"].append(
+                "One or more package additions did not deliver — removals skipped "
+                "this pass per ADR-009 (never remove old access before new access "
+                "is confirmed). See actions_taken for which package(s) failed."
+            )
+            logger.warning(
+                "Step 6 — not all additions delivered — removals skipped this pass — employee=%s",
+                employee_id,
+            )
+
+        # Step 7 — removals + attribute PATCH, gated on ADR-009
+        logger.info("Mover Step 7 — access package removals — employee=%s", employee_id)
+
+        if additions_all_succeeded:
+            remove_pending = submit_removals(
+                graph_client, user_id, frozenset(remove_confirmed),
+                current_policy_map, package_labels,
+            )
+            _poll_until_terminal(remove_pending, graph_client)
+            removal_actions = finalize_removals(
+                graph_client, user_id, remove_pending, frozenset(remove_confirmed)
+            )
+            audit_record["actions_taken"].extend(removal_actions)
+            audit_record["packages_removed"] = [
+                {"id": a["package_id"], "reason": "ROLE_CHANGE"}
+                for a in removal_actions if a["succeeded"]
+            ]
+            recently_removed = [
+                a["package_id"] for a in removal_actions if a["succeeded"]
+            ]
+
+            attr_succeeded, attr_error = apply_attribute_update(
+                graph_client, user_id, patch_dict
+            )
+            if not attr_succeeded:
+                audit_record["warnings"].append(f"Attribute update failed: {attr_error}")
+        else:
+            audit_record["packages_removed"] = []
+            recently_removed = []
+            audit_record["warnings"].append(
+                "Attribute update deferred — package additions did not all deliver, "
+                "so the role transition is not committed this pass (ADR-009). "
+                "Department/title remain at their previous values until a retry "
+                "lands every addition."
+            )
 
     # Step 8 — verification
     logger.info("Mover Step 8 — post-move verification — employee=%s", employee_id)

@@ -474,6 +474,160 @@ def stage_retention(
         },
     )
 
+
+# Pre-flight SoD (ADR-020)
+# Runs after retention, before provisioning. Queries live Entra
+# incompatibilities for each package in the add-set and classifies
+# each as ADD / REMOVE_FIRST / BLOCK.
+
+class PreFlightDecision:
+    ADD          = "ADD"
+    REMOVE_FIRST = "REMOVE_FIRST"
+    BLOCK        = "BLOCK"
+
+
+def stage_preflight_sod(
+    groups_to_add:    list[str],
+    remove_confirmed: list[str],
+    keep_set:         set[str],
+    graph_client:     "JmlGraphClient",
+    package_labels:   dict[str, str],
+) -> StageResult:
+    """
+    Pre-flight SoD gate for the Mover pipeline (ADR-020).
+
+    For each package the move would add, queries Entra for its incompatible
+    packages and classifies the result:
+
+        ADD          — no conflict with anything the user holds or keeps.
+        REMOVE_FIRST — conflict is in the confirmed-remove set; reorder
+                       to remove-before-add resolves it (ADR-011 Strategy B).
+        BLOCK        — conflict is in the keep set (unchanged + retained +
+                       unmanaged). Cannot be resolved by reordering; hold
+                       the event for operator review.
+
+    Inputs:
+        groups_to_add:    package IDs the delta says to add.
+        remove_confirmed: package IDs confirmed for removal (post-retention).
+        keep_set:         package IDs the user is keeping — union of unchanged,
+                          retain_set, and unmanaged.
+        graph_client:     JmlGraphClient with credential.
+        package_labels:   map of package ID → display name for audit.
+
+    Returns:
+        StageResult with outcome PROCEED (no blocks), HELD (at least one
+        BLOCK), or PROCEED with data["reorder"] = True (at least one
+        REMOVE_FIRST, no BLOCKs).
+    """
+    if not groups_to_add:
+        return StageResult(
+            ok=True, outcome=StageOutcome.PROCEED,
+            data={"decisions": {}, "reorder": False, "blocked_packages": []},
+            summary="Pre-flight SoD: nothing to add, skipped.",
+        )
+
+    remove_set = set(remove_confirmed)
+    decisions: dict[str, dict] = {}
+    blocked_packages: list[dict] = []
+    needs_reorder = False
+
+    for pkg_id in groups_to_add:
+        label = package_labels.get(pkg_id, pkg_id)
+        try:
+            incompatible_ids = graph_client.get_package_incompatibilities(pkg_id)
+        except Exception as e:
+            logger.error(
+                "Pre-flight SoD: failed to query incompatibilities for %s (%s): %s",
+                pkg_id, label, e,
+            )
+            # Fail open on query error — log a warning and allow the add.
+            # The platform will still enforce its own incompatibility rules.
+            decisions[pkg_id] = {
+                "decision": PreFlightDecision.ADD,
+                "reason": f"Incompatibility query failed ({e}); allowing — platform enforces.",
+            }
+            continue
+
+        if not incompatible_ids:
+            decisions[pkg_id] = {
+                "decision": PreFlightDecision.ADD,
+                "reason": "No incompatibilities configured.",
+            }
+            continue
+
+        # Check for conflicts with the keep set (BLOCK) first.
+        keep_conflicts = incompatible_ids & keep_set
+        if keep_conflicts:
+            conflict_labels = [
+                package_labels.get(c, c) for c in keep_conflicts
+            ]
+            decisions[pkg_id] = {
+                "decision": PreFlightDecision.BLOCK,
+                "reason": f"Conflicts with kept packages: {conflict_labels}",
+                "conflicting_packages": list(keep_conflicts),
+            }
+            blocked_packages.append({
+                "package_id": pkg_id,
+                "package_label": label,
+                "conflicting_packages": list(keep_conflicts),
+                "conflicting_labels": conflict_labels,
+            })
+            continue
+
+        # Check for conflicts with the remove set (REMOVE_FIRST).
+        remove_conflicts = incompatible_ids & remove_set
+        if remove_conflicts:
+            conflict_labels = [
+                package_labels.get(c, c) for c in remove_conflicts
+            ]
+            decisions[pkg_id] = {
+                "decision": PreFlightDecision.REMOVE_FIRST,
+                "reason": f"Conflicts with packages being removed: {conflict_labels}",
+                "conflicting_packages": list(remove_conflicts),
+            }
+            needs_reorder = True
+            continue
+
+        # Incompatibilities exist but none conflict with current holdings.
+        decisions[pkg_id] = {
+            "decision": PreFlightDecision.ADD,
+            "reason": "Incompatibilities exist but none conflict with current/kept packages.",
+        }
+
+    if blocked_packages:
+        block_summary = ", ".join(
+            f"{b['package_label']} (conflicts: {b['conflicting_labels']})"
+            for b in blocked_packages
+        )
+        return StageResult(
+            ok=True, outcome=StageOutcome.HELD,
+            data={
+                "decisions": decisions,
+                "reorder": False,
+                "blocked_packages": blocked_packages,
+            },
+            hold_reasons=[
+                f"SoD pre-flight BLOCK: {block_summary}. "
+                "Event held for operator review (ADR-020)."
+            ],
+            summary=f"Pre-flight SoD: {len(blocked_packages)} package(s) blocked.",
+        )
+
+    return StageResult(
+        ok=True, outcome=StageOutcome.PROCEED,
+        data={
+            "decisions": decisions,
+            "reorder": needs_reorder,
+            "blocked_packages": [],
+        },
+        summary=(
+            "Pre-flight SoD: reorder to remove-before-add (ADR-011 Strategy B)."
+            if needs_reorder
+            else "Pre-flight SoD: no conflicts, proceed normally."
+        ),
+    )
+
+
 def stage_verify(
     payload:          IdentityPayload,
     user_id:          str,

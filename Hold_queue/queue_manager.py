@@ -270,6 +270,53 @@ class HoldQueueManager:
         )
         return record
 
+    def create_from_sod_block(
+        self,
+        payload:          IdentityPayload,
+        blocked_packages: list[dict],
+    ) -> HoldRecord:
+        """
+        Create a hold record for a Mover pre-flight SoD block (ADR-020).
+
+        Called when the Mover pre-flight gate determines that a package the
+        move would add is incompatible with a package the user is keeping.
+        The event cannot proceed without operator review.
+
+        State path: RECEIVED -> NORMALIZED -> VALIDATION_FAILED -> HELD
+
+        Inputs:
+            payload:          normalised IdentityPayload for the blocked event.
+            blocked_packages: list of dicts from stage_preflight_sod, each
+                              with package_id, package_label, conflicting_packages,
+                              conflicting_labels.
+
+        Output:
+            HoldRecord in HELD state with structured SoD block reasons.
+        """
+        reasons = _serialise_sod_blocks(blocked_packages)
+
+        record = HoldRecord(
+            record_id=       _new_id(),
+            employee_id=     payload.employee_id,
+            upn=             payload.upn,
+            status=          HoldStatus.RECEIVED,
+            failure_reasons= reasons,
+            payload_snapshot=_serialize_payload(payload),
+        )
+        self._store.save(record)
+        self.transition(record, HoldStatus.NORMALIZED)
+        self.transition(record, HoldStatus.VALIDATION_FAILED)
+        self.transition(record, HoldStatus.HELD)
+
+        logger.warning(
+            "Hold record created from Mover SoD block (ADR-020): %s "
+            "(employee=%s, blocked_packages=%d)",
+            record.record_id,
+            payload.employee_id,
+            len(blocked_packages),
+        )
+        return record
+
     # State transitions
 
     def transition(self, record: HoldRecord, new_status: HoldStatus) -> None:
@@ -423,5 +470,29 @@ def _serialise_sod_violations(violations: list) -> list[str]:
             line += f"\nCompensating control: {v.compensating_control}"
         if v.exception_applied:
             line += "\nException applied — violation permitted by pre-approved exception."
+        reasons.append(line)
+    return reasons
+
+
+def _serialise_sod_blocks(blocked_packages: list[dict]) -> list[str]:
+    """
+    Serialise Mover pre-flight SoD block data into structured reason strings.
+
+    Format per blocked package:
+        [SoD Pre-Flight] Package "Finance Approver" (abc-123)
+        Conflicts with kept packages: Treasury Admin (def-456), Payments (ghi-789)
+        Action: BLOCK — event held for operator review (ADR-020).
+    """
+    reasons = []
+    for b in blocked_packages:
+        conflicts = ", ".join(
+            f"{label} ({pid})"
+            for label, pid in zip(b["conflicting_labels"], b["conflicting_packages"])
+        )
+        line = (
+            f"[SoD Pre-Flight] Package \"{b['package_label']}\" ({b['package_id']})\n"
+            f"Conflicts with kept packages: {conflicts}\n"
+            f"Action: BLOCK — event held for operator review (ADR-020)."
+        )
         reasons.append(line)
     return reasons
