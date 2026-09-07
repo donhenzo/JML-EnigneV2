@@ -1285,55 +1285,55 @@ class JmlGraphClient:
             )
 
     @retry_on_throttle(max_retries=3, base_backoff=2.0)
-def get_package_incompatibilities(self, package_id: str) -> set[str]:
-    import httpx
-    if self._credential is None:
-        raise GraphClientError(
-            "No credential available for get_package_incompatibilities HTTP call. "
-            "Ensure JmlGraphClient is constructed via build_graph_client()."
+    def get_package_incompatibilities(self, package_id: str) -> set[str]:
+        import httpx
+        if self._credential is None:
+            raise GraphClientError(
+                "No credential available for get_package_incompatibilities HTTP call. "
+                "Ensure JmlGraphClient is constructed via build_graph_client()."
+            )
+
+        # Navigate the endpoint instead of $expand
+        endpoint = (
+            f"https://graph.microsoft.com/v1.0/identityGovernance"
+            f"/entitlementManagement/accessPackages/{package_id}"
+            f"/incompatibleAccessPackages?$select=id,displayName&$top=999"
         )
 
-    # Navigate the endpoint instead of $expand
-    endpoint = (
-        f"https://graph.microsoft.com/v1.0/identityGovernance"
-        f"/entitlementManagement/accessPackages/{package_id}"
-        f"/incompatibleAccessPackages?$select=id,displayName&$top=999"
-    )
+        all_ids: set[str] = set()
+        try:
+            token = self._credential.get_token("https://graph.microsoft.com/.default")
+            headers = {"Authorization": f"Bearer {token.token}"}
 
-    all_ids: set[str] = set()
-    try:
-        token = self._credential.get_token("https://graph.microsoft.com/.default")
-        headers = {"Authorization": f"Bearer {token.token}"}
+            url: str | None = endpoint
+            while url:
+                response = httpx.get(url, headers=headers, timeout=30)
+                if response.status_code != 200:
+                    raise GraphClientError(
+                        f"get_package_incompatibilities failed for {package_id} — "
+                        f"status={response.status_code}, body={response.text[:300]}",
+                        status_code=response.status_code,
+                    )
+                body = response.json()
 
-        url: str | None = endpoint
-        while url:
-            response = httpx.get(url, headers=headers, timeout=30)
-            if response.status_code != 200:
-                raise GraphClientError(
-                    f"get_package_incompatibilities failed for {package_id} — "
-                    f"status={response.status_code}, body={response.text[:300]}",
-                    status_code=response.status_code,
-                )
-            body = response.json()
+                # Navigation endpoint returns results in "value", not "incompatibleAccessPackages"
+                for item in body.get("value", []):
+                    if "id" in item:
+                        all_ids.add(item["id"])
 
-            # Navigation endpoint returns results in "value", not "incompatibleAccessPackages"
-            for item in body.get("value", []):
-                if "id" in item:
-                    all_ids.add(item["id"])
+                
+                url = body.get("@odata.nextLink")
 
-            
-            url = body.get("@odata.nextLink")
+            return all_ids
 
-        return all_ids
-
-    except GraphClientError:
-        raise
-    except Exception as e:
-        status_code = _extract_status_code(e)
-        raise GraphClientError(
-            f"get_package_incompatibilities failed for {package_id}: {e}",
-            status_code=status_code,
-        )
+        except GraphClientError:
+            raise
+        except Exception as e:
+            status_code = _extract_status_code(e)
+            raise GraphClientError(
+                f"get_package_incompatibilities failed for {package_id}: {e}",
+                status_code=status_code,
+            )
 
     @retry_on_throttle(max_retries=3, base_backoff=2.0)
     def disable_user(self, user_id: str) -> None:
