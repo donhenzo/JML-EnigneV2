@@ -15,7 +15,7 @@
     "security": "Security",
     "cybersecurity": "Cybersecurity"
   },
-  "job_title": {
+    "job_title": {
     "software engineer": "Software Engineer",
     "swe": "Software Engineer",
     "senior software engineer": "Senior Software Engineer",
@@ -55,7 +55,29 @@
     "software engineering": "Software Engineering",
     "hr": "HR",
     "human resources": "HR",
-    "people": "HR"
+    "people": "HR",
+    "treasury analyst": "Treasury Analyst",
+    "treasury specialist": "Treasury Analyst",
+    "vendor master analyst": "Vendor Master Analyst",
+    "vendor management analyst": "Vendor Master Analyst",
+    "internal auditor": "Internal Auditor",
+    "auditor": "Internal Auditor",
+    "access administrator": "Access Administrator",
+    "iam access administrator": "Access Administrator",
+    "access reviewer": "Access Reviewer",
+    "iam access reviewer": "Access Reviewer",
+    "cloud platform engineer": "Cloud Platform Engineer",
+    "cloud engineer": "Cloud Platform Engineer",
+    "security log admin": "Security Log Admin",
+    "log admin": "Security Log Admin",
+    "requisition analyst": "Requisition Analyst",
+    "procurement analyst": "Requisition Analyst",
+    "po approver": "PO Approver",
+    "purchase order approver": "PO Approver",
+    "payroll administrator": "Payroll Administrator",
+    "payroll admin": "Payroll Administrator",
+    "hris analyst": "HRIS Analyst",
+    "hris administrator": "HRIS Analyst"
   },
  "employment_type": {
     "employee": "Employee",

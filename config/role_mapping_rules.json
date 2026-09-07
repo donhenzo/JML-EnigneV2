@@ -110,7 +110,84 @@
         "accessPackageId": "44371b1c-49d4-49d4-b383-db52f7ab5001",
         "policyId": "38ec9fca-d687-485a-b71d-a264caa9a31e"
       }
-    }
-    
+    },
+        {
+      "id": "IT-ACCESSADMIN-001",
+      "description": "Identity Administration — provisions accounts and assigns access",
+      "conditions": {
+        "department": { "operator": "exact", "value": "Information Technology" },
+        "jobTitle": { "operator": "contains", "value": "Access Administrator" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "30e8955c-4227-4ca6-a6ca-7ee441252a2c",
+        "policyId": "b546ce7c-ce44-41e6-8dce-87786a4578f8"
+      }
+    },
+    {
+      "id": "IT-ACCESSREVIEW-001",
+      "description": "Access Governance — certifies and reviews access; must not also provision it",
+      "conditions": {
+        "department": { "operator": "exact", "value": "Information Technology" },
+        "jobTitle": { "operator": "contains", "value": "Access Reviewer" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "1abf25a3-812b-4655-991a-9de848783dd3",
+        "policyId": "dd0b04fd-1b61-457c-b8bc-ad2c35ca392b"
+      }
+    },
+    {
+      "id": "IT-CLOUDPLATFORM-001",
+      "description": "Cloud Platform (Prod) — Owner on production subscriptions",
+      "conditions": {
+        "department": { "operator": "exact", "value": "Information Technology" },
+        "jobTitle": { "operator": "contains", "value": "Cloud Platform Engineer" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "e643af81-b566-48da-9508-400e7d35e145",
+        "policyId": "f03b32c6-30e2-4b7c-94e3-d14e7f82d71f"
+      }
+    },
+    {
+      "id": "IT-SECURITYOPS-001",
+      "description": "Security Operations — SIEM/audit-log admin; must not also hold prod Owner",
+      "conditions": {
+        "department": { "operator": "exact", "value": "Information Technology" },
+        "jobTitle": { "operator": "contains", "value": "Security Log Admin" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "eeebad6f-bd3d-4c9c-bf45-f223318a578b",
+        "policyId": "1823aecf-9991-4ade-901b-8c96dd1faa6e"
+      }
+    },
+        {
+      "id": "PAYROLL-ADMIN-001",
+      "description": "Payroll Operations — edits pay rates and runs payroll",
+      "conditions": {
+        "department": { "operator": "exact", "value": "HR" },
+        "jobTitle": { "operator": "contains", "value": "Payroll Administrator" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "ab140c4d-3082-4fa8-9b8e-15a56a511347",
+        "policyId": "0d7a637a-0a17-407a-a848-9f31d64cfa18"
+      }
+    },
+    {
+      "id": "HR-PEOPLEOPS-001",
+      "description": "People Operations — HRIS employee master data + bulk data export; must not also run payroll",
+      "conditions": {
+        "department": { "operator": "exact", "value": "HR" },
+        "jobTitle": { "operator": "contains", "value": "HRIS Analyst" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "f1aba94c-7c6c-42ae-8d3b-af56f3e4bd7f",
+        "policyId": "ee3d5d90-5098-4641-a246-e13cb0da95f5"
+      }
+    } 
   ]
 }
