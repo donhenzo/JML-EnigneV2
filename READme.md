@@ -43,23 +43,28 @@ The engine:
 2. Resolves the target entitlements.
 3. Calculates the access delta.
 4. Evaluates retention requirements.
-5. Adds new access first.
-6. Waits for delivery.
-7. Removes obsolete access.
-8. Updates identity attributes.
-9. Verifies the resulting tenant state (including PostProvision governance).
+5. Runs a pre-flight Separation of Duties check against live Entra incompatibility configuration.
+6. Adds new access first — or removes a conflicting package first, if the pre-flight determined that's the safe order.
+7. Waits for delivery.
+8. Removes obsolete access.
+9. Updates identity attributes.
+10. Verifies the resulting tenant state (including PostProvision governance).
 
-The critical property is **add-before-remove**.
+The critical property is **add-before-remove, unless the pre-flight determines a specific conflicting package must be removed first** to avoid a platform rejection.
 
 If the new access cannot be delivered, the old access is not removed.
 
-The Mover runs as an Azure Durable Functions orchestration. Like the Joiner, the HTTP call returns immediately and both the addition and removal deliveries are polled through durable timers rather than blocking waits — so a role change whose packages take several minutes to deliver completes cleanly instead of being cut off at the gateway timeout. The add-before-remove gate lives in the orchestrator: removals and the attribute update run only after every addition is confirmed delivered.
+The Mover runs as an Azure Durable Functions orchestration. Like the Joiner, the HTTP call returns immediately and both the addition and removal deliveries are polled through durable timers rather than blocking waits — so a role change whose packages take several minutes to deliver completes cleanly instead of being cut off at the gateway timeout. The add-before-remove gate lives in the orchestrator: removals and the attribute update run only after every addition is confirmed delivered. The pre-flight SoD check runs before either sequence begins, and its decision (add-first, remove-first, or block) determines which path the orchestrator takes.
 
 ```mermaid
 flowchart LR
     CUR["Current Access"] --> DELTA["Delta"]
     TGT["Target Access"] --> DELTA
-    DELTA --> ADD["Add"]
+    DELTA --> PREFLIGHT{"Pre-flight SoD<br/>ADR-011"}
+    PREFLIGHT -->|"No conflict"| ADD["Add"]
+    PREFLIGHT -->|"Conflict, in removal set"| REMFIRST["Remove conflicting<br/>package first"]
+    PREFLIGHT -->|"Conflict, being kept"| BLOCK["BLOCK<br/>hold for review"]
+    REMFIRST --> ADD
     ADD --> POLL1["Poll for Delivery<br/>durable timer loop"]
     POLL1 --> GATE{"All added<br/>delivered?"}
     GATE -->|Yes| REM["Remove"] --> POLL2["Poll for Removal<br/>durable timer loop"]
@@ -123,10 +128,12 @@ A failed **PreProvision** Joiner or Mover therefore does not create an identity 
 | Layer | When | Behaviour | Status |
 | --- | --- | --- | --- |
 | Platform incompatibility (Entra) | at assignment | Entra rejects a conflicting `adminAdd` on any provisioning path | Configured & proven |
-| Mover pre-flight (ADR-011) | before adds, in-engine | queries incompatibility, reorders (remove-first) or blocks a genuine conflict | Planned — next build |
+| Mover pre-flight (ADR-011) | before adds, in-engine | queries live Entra incompatibility configuration; reorders (remove-first) for a legitimate transition or blocks a genuine conflict | Built & proven |
 | PostProvision detective | after delivery | records SoD conflicts (including direct-assignment drift) for review | Built & proven |
 
 The Separation of Duties catalogue is **group-anchored** — conflicts are authored once against real group object IDs, and platform incompatibility is derived from that. Blocking SoD is the platform's and the pre-flight's job; the in-engine PostProvision layer is detective and does not block.
+
+The pre-flight queries Entra's `incompatibleAccessPackages` for each package a Mover would add, and classifies the result three ways: **add normally** if nothing held conflicts; **remove the conflicting package first, then add** if the conflict is with something already being removed as part of the same role change (a legitimate transition — the old, conflicting access is leaving anyway); or **block the event and hold it for review** if the conflict is with something the user is keeping. This is what lets a real role change — one that momentarily looks incompatible mid-transition — complete cleanly instead of being rejected by the platform, while a genuine attempt to hold two conflicting duties at once is stopped before any write.
 
 ---
 
@@ -169,7 +176,7 @@ Long-running entitlement delivery runs on Azure Durable Functions, so that polli
 | Pipeline   | Execution Model                          | Status      |
 | ---------- | ---------------------------------------- | ----------- |
 | **Joiner** | Durable Functions — timer-driven polling | ✅ Complete  |
-| **Mover**  | Durable Functions — timer-driven polling | ✅ Complete  |
+| **Mover**  | Durable Functions — timer-driven polling, pre-flight SoD branch | ✅ Complete  |
 | **Leaver** | Durable Functions — timer-driven polling | ✅ Complete  |
 
 Each pipeline also retains a synchronous execution path, used by the CSV/local runner alongside its HTTP entry point.
@@ -188,6 +195,8 @@ The lifecycle has been exercised against a live Entra tenant.
 | **PreProvision gate** | Contractor targeting a management-tier role blocked before any write |
 | **PostProvision gate**| Contractor in a restricted duty group detected and recorded post-delivery |
 | **Platform SoD**      | Conflicting Access Package assignment denied by Entra at request time |
+| **Mover pre-flight — remove-first** | A legitimate role transition into a conflicting duty correctly removed the old package, confirmed delivery, then added the new one — no platform rejection |
+| **Mover pre-flight — block** | A role change that would have kept one conflicting package while adding another was held for review before any write, with the conflicting pair named in the audit record |
 | **AWS SCIM**          | Groups and users provisioned to AWS IAM Identity Center            |
 | **AWS authorization** | Permission Set assignment and EC2 access verified                  |
 | **M365**              | Native group-based Teams/SharePoint access verified               |
@@ -204,7 +213,8 @@ The important part is that this is not only a policy simulation. The workflows e
 * Policy-driven entitlement resolution using JSON configuration
 * Group-anchored Separation of Duties catalogue
 * Platform-level SoD enforcement via Access Package incompatibilities
-* Add-before-remove Mover sequencing
+* Mover pre-flight SoD check — queries live incompatibility configuration and chooses add, remove-first, or block per package
+* Add-before-remove Mover sequencing (with pre-flight-driven remove-first override for conflicting packages)
 * Disable-before-remove Leaver sequencing
 * Active PIM session termination during offboarding
 * Configurable soft-delete hold with durable-timer deferred deletion (re-hire-safe)
@@ -239,7 +249,7 @@ The important part is that this is not only a policy simulation. The workflows e
 | API                     | Microsoft Graph                                    |
 | Governance              | In-process (Python) — PreProvision + PostProvision |
 | Continuous validation   | PowerShell Azure Function (standalone scanner)     |
-| Authorization           | Access Packages + Entra incompatibility (SoD)      |
+| Authorization           | Access Packages + Entra incompatibility (SoD) + Mover pre-flight |
 | Downstream provisioning | SCIM / Microsoft 365 groups                        |
 | Cloud                   | Microsoft Azure + AWS                              |
 | Storage                 | Azure Table Storage                                |
@@ -273,6 +283,7 @@ The important part is that this is not only a policy simulation. The workflows e
 * **In-process PostProvision governance gate (detective, records; reads real memberOf) — proven on tenant**
 * **Platform-level Separation of Duties via Access Package incompatibilities — configured and proven**
 * **Group-anchored SoD catalogue and GUID-keyed governance model**
+* **Mover pre-flight blocking SoD (ADR-011) — queries live Entra incompatibility before adds; proven choosing add, remove-first, and block correctly on the live tenant**
 * BambooHR ingestion
 * CSV execution
 * Direct HTTP lifecycle events
@@ -282,7 +293,7 @@ The important part is that this is not only a policy simulation. The workflows e
 
 ### In Progress / Planned
 
-* **Mover pre-flight blocking SoD (ADR-011)** — query Entra incompatibility before adds; reorder (remove-first) for a legitimate transition, block a genuine conflict. Next build.
+* Reviewable Mover hold queue with release/resume — pre-flight BLOCK events currently write to an in-memory hold store, not a persistent, reviewable queue
 * Standalone Validation Engine as continuous, tenant-wide evaluation (scheduled scanner)
 * `employment_status` field + action-deriver Leaver rule
 * Last-state store for webhook-driven lifecycle processing
@@ -290,7 +301,6 @@ The important part is that this is not only a policy simulation. The workflows e
 * Event-store recovery/reclaim for failed events
 * Reconciliation pipeline (event repair; also the home for automated remediation of detected drift)
 * Resumable recovery for a partially failed Leaver (the deferred-delete path is built; broader mid-run resume is not)
-* Reviewable Mover hold queue with release/resume
 * Entra Entitlement Management approval workflow integration
 * Storage-enforced audit immutability (write-once blob)
 * Managed Identity authentication
@@ -340,7 +350,7 @@ This provides the interface required for eventual HR webhook integration.
 
 ### Governance before access
 
-Policy and governance are evaluated before provisioning. The PreProvision gate can stop an event before any Graph write.
+Policy and governance are evaluated before provisioning. The PreProvision gate can stop an event before any Graph write, and the Mover pre-flight can stop or reorder a role change before any package is submitted.
 
 ### Detective backstop after access
 
@@ -358,9 +368,9 @@ When required governance information cannot be established, the lifecycle event 
 
 The account is disabled and sessions revoked before access removal begins.
 
-### Add before remove
+### Add before remove — unless a conflict says otherwise
 
-Movers gain the required destination access before losing their existing access.
+Movers gain the required destination access before losing their existing access, except where the pre-flight has determined that a specific conflicting package must be removed first to avoid a platform rejection.
 
 ### Deterministic resolution
 
