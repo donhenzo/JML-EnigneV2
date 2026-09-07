@@ -188,6 +188,58 @@
         "accessPackageId": "f1aba94c-7c6c-42ae-8d3b-af56f3e4bd7f",
         "policyId": "ee3d5d90-5098-4641-a246-e13cb0da95f5"
       }
-    } 
+    }, 
+        {
+      "id": "FINANCE-TREASURY-001",
+      "description": "Treasury team — payment run execution and bank reconciliation",
+      "conditions": {
+        "department": { "operator": "exact", "value": "Finance" },
+        "jobTitle": { "operator": "contains", "value": "Treasury" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "a28b873f-cbc6-4bdf-ac13-15304180e405",
+        "policyId": "7ac98515-4d1f-41f7-8be2-626e6892c27a"
+      }
+    },
+    {
+      "id": "FINANCE-VENDORMASTER-001",
+      "description": "Vendor/procurement master data maintenance",
+      "conditions": {
+        "department": { "operator": "exact", "value": "Finance" },
+        "jobTitle": { "operator": "contains", "value": "Vendor" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "f1153899-70b0-4878-8333-36125ad498de",
+        "policyId": "b48b9a9d-d92c-4d9d-ae19-d41e502d2fd0"
+      }
+    },
+    {
+      "id": "FINANCE-ACCOUNTANT-001",
+      "description": "General ledger posting and AP invoice entry",
+      "conditions": {
+        "department": { "operator": "exact", "value": "Finance" },
+        "jobTitle": { "operator": "contains", "value": "Accountant" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "d392ce9d-f43e-4d95-bdb9-4817939e3869",
+        "policyId": "003306e4-9753-4810-86bc-3582f098adac"
+      }
+    },
+    {
+      "id": "FINANCE-AUDITOR-001",
+      "description": "Internal audit — independent review, must not also post journals or manage vendors",
+      "conditions": {
+        "department": { "operator": "exact", "value": "Finance" },
+        "jobTitle": { "operator": "contains", "value": "Auditor" },
+        "employmentType": { "operator": "exact", "value": "Employee" }
+      },
+      "entitlements": {
+        "accessPackageId": "7ebf6d75-a25a-458a-9184-50c3c037739b",
+        "policyId": "bf55ae72-684e-4a52-b009-16814564c435"
+      }
+    }
   ]
 }
