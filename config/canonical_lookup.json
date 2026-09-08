@@ -82,6 +82,7 @@
  "employment_type": {
     "employee": "Employee",
     "full-time": "Employee",
+    "Full-Time": "Employee",
     "ft": "Employee",
     "fte": "Employee",
     "permanent": "Employee",
