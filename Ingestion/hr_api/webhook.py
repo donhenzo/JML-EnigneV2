@@ -2,15 +2,11 @@
 Ingestion/hr_api/webhook.py
 
 
+Receives a BambooHR webhook notification, extracts employee IDs,
+fetches the full record for each from BambooHR, and maps it to
+the JML engine's raw identity shape.
 
-Receives a BambooHR webhook notification, validates the request,
-extracts the employee ID, and returns 200. No fetch, no derivation,
-no dispatch yet — those come in Steps 2–4.
-
-BambooHR sends a POST when an employee record changes. The payload
-shape varies by webhook configuration, but always contains at least
-one employee identifier. This handler normalizes that into a list
-of employee IDs and acknowledges receipt.
+Steps 3–4 will add action derivation and durable dispatch.
 """
 
 import json
@@ -18,12 +14,13 @@ import logging
 
 import azure.functions as func
 
+from Ingestion.hr_api.bamboohr.bamboohr_client import get_employee
+from Ingestion.hr_api.bamboohr.bamboohr_mapper import map_to_raw_identity
+
 logger = logging.getLogger(__name__)
 
-# Step 1 — Webhook shell.
 
 async def handle(req: func.HttpRequest, starter: str) -> func.HttpResponse:
-    # Parse the incoming JSON body.
     try:
         body = req.get_json()
     except (ValueError, TypeError):
@@ -34,11 +31,6 @@ async def handle(req: func.HttpRequest, starter: str) -> func.HttpResponse:
             mimetype="application/json",
         )
 
-    # Extract employee IDs from the webhook payload.
-    # BambooHR webhooks can arrive in several shapes:
-    #   - {"employees": [{"id": "123"}, ...]}   (standard webhook)
-    #   - {"employee_id": "123"}                 (single-event shorthand)
-    # We normalize to a list of string IDs.
     employee_ids = _extract_employee_ids(body)
     if not employee_ids:
         logger.warning("Webhook payload contained no employee IDs: %s", body)
@@ -54,17 +46,22 @@ async def handle(req: func.HttpRequest, starter: str) -> func.HttpResponse:
         employee_ids,
     )
 
-    # Step 1 stops here. Steps 2–4 will add:
-    #   2. Fetch full record from BambooHR for each employee ID
-    #   3. Map fields + derive action (Joiner/Mover/Leaver/Skip)
-    #   4. Start the correct durable orchestration
+    # Step 2: fetch full record from BambooHR and map each employee.
+    results = []
+    for emp_id in employee_ids:
+        try:
+            raw = get_employee(emp_id)
+            mapped = map_to_raw_identity(raw)
+            results.append({"employee_id": emp_id, "status": "mapped", "mapped": mapped})
+            logger.info("Fetched and mapped employee %s", emp_id)
+        except Exception as e:
+            logger.error("Failed to fetch/map employee %s: %s", emp_id, e)
+            results.append({"employee_id": emp_id, "status": "error", "error": str(e)})
+
+    # Steps 3–4 will add action derivation and durable dispatch here.
 
     return func.HttpResponse(
-        json.dumps({
-            "status": "received",
-            "employee_ids": employee_ids,
-            "actions_taken": "none — shell only",
-        }),
+        json.dumps({"status": "processed", "results": results}, default=str),
         status_code=200,
         mimetype="application/json",
     )
@@ -74,7 +71,6 @@ def _extract_employee_ids(body: dict) -> list[str]:
     """Pull employee IDs from whichever webhook shape arrives."""
     ids: list[str] = []
 
-    # Standard BambooHR webhook: list of employee objects.
     employees = body.get("employees")
     if isinstance(employees, list):
         for emp in employees:
@@ -83,7 +79,6 @@ def _extract_employee_ids(body: dict) -> list[str]:
                 ids.append(str(emp_id))
         return ids
 
-    # Single-event shorthand.
     single = body.get("employee_id")
     if single is not None:
         return [str(single)]
