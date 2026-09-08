@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import uuid
+from datetime import date as date_type
 from pathlib import Path
 
 from Ingestion.schema import IdentityPayload, EmploymentType, JmlAction
@@ -116,6 +117,88 @@ class PipelineContext:
             self.mapping_rules = []
 
 
+def build_identity_payload(mapped: dict, lookup: dict) -> IdentityPayload:
+    """
+    Convert a raw mapper dict into a clean IdentityPayload.
+
+    Handles employment type resolution via the canonical lookup table,
+    date parsing, Leaver-specific termination date logic, and stripping
+    of extra fields (bamboohr_id, termination_date) that are not part
+    of the IdentityPayload contract.
+
+    This is the single place where raw HR data becomes a typed payload.
+    Both the synchronous pipeline adapter and the webhook dispatcher
+    call this function.
+
+    Args:
+        mapped: raw identity dict from bamboohr_mapper.map_to_raw_identity()
+                Must include 'action' set by the action deriver.
+        lookup: canonical lookup table from load_lookup_table()
+
+    Returns:
+        IdentityPayload ready for normalisation and pipeline entry.
+
+    Raises:
+        ValueError: if a required field has an invalid value that cannot
+                    be resolved (e.g. unknown employment type on a
+                    non-Leaver record).
+    """
+    employee_id = mapped.get("employee_id", "unknown")
+    action_str = mapped.get("action", "")
+
+    # Resolve raw employment type to canonical enum value.
+    # BambooHR sends "Full-Time", the enum expects "Employee".
+    raw_emp_type = mapped.get("employment_type", "")
+    emp_type_lookup = lookup.get("employment_type", {})
+    resolved_emp_type = emp_type_lookup.get(raw_emp_type.lower(), raw_emp_type)
+
+    # Parse start_date string to a date object.
+    # For Leaver events, use termination_date instead of hireDate so the
+    # event ID hash (EmployeeId + Action + StartDate) produces a distinct
+    # event from the original Joiner.
+    if action_str == "Leaver" and mapped.get("termination_date"):
+        start_date_str = mapped["termination_date"]
+    else:
+        start_date_str = mapped.get("start_date", "")
+    try:
+        start_date = date_type.fromisoformat(start_date_str) if start_date_str else date_type.today()
+    except ValueError:
+        logger.warning(
+            "Invalid start_date '%s' for employee %s — using today",
+            start_date_str, employee_id
+        )
+        start_date = date_type.today()
+
+    # For Leaver records, employment_type may not parse cleanly —
+    # fall back to EMPLOYEE rather than failing on a field the Leaver
+    # pipeline never reads (ADR-014).
+    try:
+        employment_type = EmploymentType(resolved_emp_type)
+    except ValueError:
+        if action_str == "Leaver":
+            employment_type = EmploymentType.EMPLOYEE
+        else:
+            raise ValueError(
+                f"Invalid employment type '{resolved_emp_type}' "
+                f"for employee {employee_id}"
+            )
+
+    return IdentityPayload(
+        employee_id=employee_id,
+        upn=mapped.get("upn", "unknown"),
+        display_name=mapped.get("display_name", ""),
+        department=mapped.get("department", "") if action_str != "Leaver" else None,
+        job_title=mapped.get("job_title", "") if action_str != "Leaver" else None,
+        manager_id=mapped.get("manager_id") or None,
+        start_date=start_date,
+        employment_type=employment_type,
+        location=mapped.get("location") or None,
+        action=JmlAction(action_str),
+        retain_roles=mapped.get("retain_roles", False),
+        retain_list=mapped.get("retain_list", []),
+    )
+
+
 def run_single_record(mapped: dict, ctx: PipelineContext) -> bool:
     """
     Process a single HR API record through the full JML pipeline.
@@ -137,75 +220,9 @@ def run_single_record(mapped: dict, ctx: PipelineContext) -> bool:
     upn = mapped.get("upn", "unknown")
     action_str = mapped.get("action", "")
 
-    # Step 1 — Resolve raw employment type to canonical value before
-    # constructing the payload. BambooHR sends "Full-Time", the enum
-    # expects "Employee". The canonical lookup handles this translation.
-    raw_emp_type = mapped.get("employment_type", "")
-    emp_type_lookup = ctx.lookup.get("employment_type", {})
-    resolved_emp_type = emp_type_lookup.get(raw_emp_type.lower(), raw_emp_type)
-
-    # Parse start_date string to a date object — IdentityPayload expects date, not str.
-    # For Leaver events, use termination_date instead of hireDate — the event
-    # ID hash (EmployeeId + Action + StartDate) needs the actual termination
-    # date so a re-hire after a Leaver produces a distinct event, and so the
-    # Leaver event ID doesn't collide with the original Joiner's.
-    from datetime import date as date_type
-
-    if action_str == "Leaver" and mapped.get("termination_date"):
-        start_date_str = mapped["termination_date"]
-    else:
-        start_date_str = mapped.get("start_date", "")
+    # Build the typed payload using the shared builder
     try:
-        start_date = date_type.fromisoformat(start_date_str) if start_date_str else date_type.today()
-    except ValueError:
-        logger.warning(
-            "Invalid start_date '%s' for employee %s — using today",
-            start_date_str, employee_id
-        )
-        start_date = date_type.today()
-
-    # For Leaver records, employment_type may not parse cleanly from
-    # a terminated HR record — fall back to EMPLOYEE rather than
-    # failing the payload construction over a field the Leaver
-    # pipeline never reads (ADR-014).
-    try:
-        employment_type = EmploymentType(resolved_emp_type)
-    except ValueError:
-        if action_str == "Leaver":
-            employment_type = EmploymentType.EMPLOYEE
-        else:
-            # Non-Leaver: let the original error surface
-            logger.error(
-                "Invalid employment type '%s' for employee %s",
-                resolved_emp_type, employee_id
-            )
-            report = DecisionReport(
-                upn=upn,
-                employee_id=employee_id,
-                event=ReportEvent.JOINER,
-                correlation_id=ctx.correlation_id,
-                normalization_status=NormalizationStatus.FAILED,
-                validation_status=ValidationStatus.SKIPPED,
-            )
-            report.add_hold_reason(f"Invalid employment type: {resolved_emp_type}")
-            _write_report(report, ctx.output_dir)
-            return False
-
-    try:
-        payload = IdentityPayload(
-            employee_id=employee_id,
-            upn=upn,
-            display_name=mapped.get("display_name", ""),
-            department=mapped.get("department", "") if action_str != "Leaver" else None,
-            job_title=mapped.get("job_title", "") if action_str != "Leaver" else None,
-            manager_id=mapped.get("manager_id") or None,
-            start_date=start_date,
-            employment_type=employment_type,
-            location=mapped.get("location") or None,
-            action=JmlAction(action_str),
-            retain_roles=mapped.get("retain_roles", False),
-            retain_list=mapped.get("retain_list", []),
-        )
+        payload = build_identity_payload(mapped, ctx.lookup)
     except ValueError as exc:
         logger.error(
             "Invalid field value for employee %s: %s", employee_id, exc
@@ -222,20 +239,16 @@ def run_single_record(mapped: dict, ctx: PipelineContext) -> bool:
         _write_report(report, ctx.output_dir)
         return False
 
-    # Step 2 — Route by action
+    # Route by action
     #
     # Leaver routes BEFORE normalisation — the Leaver pipeline has no
     # entitlement resolution (ADR-014), so it never reads department
     # or job_title. Running those through the normaliser would only
-    # risk holding the record on fields that don't matter. This
-    # matches what run_leaver_csv_mode does in run_local.py.
-    #
-    # Mover and Joiner normalise first, then route.
-
+    # risk holding the record on fields that don't matter.
     if payload.action == JmlAction.LEAVER:
         return _run_leaver_record(payload, ctx)
 
-    # Step 3 — Normalise (Joiner and Mover only)
+    # Normalise (Joiner and Mover only)
     report = DecisionReport(
         upn=upn,
         employee_id=employee_id,
@@ -270,7 +283,7 @@ def run_single_record(mapped: dict, ctx: PipelineContext) -> bool:
     )
     normalised_payload = norm_result.payload
 
-    # Step 4 — Route Mover or Joiner
+    # Route Mover or Joiner
     if normalised_payload.action == JmlAction.MOVER:
         return _run_mover_record(normalised_payload, ctx)
 
@@ -359,7 +372,7 @@ def _run_joiner_record(
     employee_id  = normalised_payload.employee_id
     event_id_str = ""
 
-    # Step 3 — Claim event (idempotency guard)
+    # Claim event (idempotency guard)
     payload_json = json.dumps({
         "employee_id": normalised_payload.employee_id,
         "upn":         normalised_payload.upn,
@@ -394,7 +407,7 @@ def _run_joiner_record(
         normalised_payload.start_date.isoformat(),
     )
 
-    # Step 4 — Conflict check
+    # Conflict check
     conflict_outcome = check_and_handle_conflict(
         table_client = ctx.events_client,
         employee_id  = normalised_payload.employee_id,
@@ -414,7 +427,7 @@ def _run_joiner_record(
         _write_report(report, ctx.output_dir)
         return True
 
-    # Step 5 — Resolve entitlements
+    # Resolve entitlements
     entitlements = resolve_entitlements(
         rules           = mapping_rules_from_ctx(ctx),
         department      = normalised_payload.department,
@@ -438,7 +451,7 @@ def _run_joiner_record(
             "No mapping rules matched — user will have no group or RBAC assignments"
         )
 
-    # Step 6 — Pre-provision validation gate
+    # Pre-provision validation gate
     validation_result = pre_provision_validate(normalised_payload)
 
     if not validation_result.passed:
@@ -467,7 +480,7 @@ def _run_joiner_record(
     for warning in validation_result.warning_summary():
         report.add_warning(warning)
 
-    # Step 7 — Guard: Graph client required
+    # Guard: Graph client required
     if ctx.graph_client is None:
         report.add_action(
             action    = "ProvisioningSkipped",
@@ -484,7 +497,7 @@ def _run_joiner_record(
         _write_report(report, ctx.output_dir)
         return False
 
-    # Step 8 — Acquire lock and provision
+    # Acquire lock and provision
     instance_id = str(uuid.uuid4())
     acquire_lock(
         ctx.events_client, normalised_payload.employee_id,
@@ -513,7 +526,7 @@ def _run_joiner_record(
         _write_report(report, ctx.output_dir)
         return False
 
-    # Step 9 — Post-provision validation
+    # Post-provision validation
     post_result = post_provision_validate(
         entra_object_id = provisioning_result.entra_id,
         employee_id     = normalised_payload.employee_id,
@@ -542,7 +555,7 @@ def _run_joiner_record(
     for warning in post_result.warning_summary():
         report.add_warning(warning)
 
-    # Step 10 — Success
+    # Success
     release_lock(
         ctx.events_client, normalised_payload.employee_id, event_id_str
     )

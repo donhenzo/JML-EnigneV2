@@ -4,8 +4,9 @@ Ingestion/hr_api/webhook.py
 Steps 1–4 — Webhook receive → fetch → map → derive → dispatch.
 
 Receives a BambooHR webhook, fetches the full record, maps it,
-derives the lifecycle action, and starts the correct durable
-orchestration (Joiner / Mover / Leaver). Skips are logged only.
+derives the lifecycle action, builds a clean IdentityPayload via the
+shared builder, and starts the correct durable orchestration
+(Joiner / Mover / Leaver). Skips are logged only.
 """
 
 import json
@@ -17,6 +18,8 @@ import azure.durable_functions as df
 from Ingestion.hr_api.bamboohr.bamboohr_client import get_employee
 from Ingestion.hr_api.bamboohr.bamboohr_mapper import map_to_raw_identity
 from Ingestion.hr_api.action_deriver import derive_action
+from Ingestion.hr_api.bamboohr.pipeline_adapter import build_identity_payload
+from Normalization.lookup_loader import load_lookup_table
 from Provisioning.graph_client import build_graph_client, JmlGraphClient
 
 logger = logging.getLogger(__name__)
@@ -27,6 +30,17 @@ _ORCHESTRATOR_MAP = {
     "Mover":  "mover_durable_orchestrator",
     "Leaver": "leaver_durable_orchestrator",
 }
+
+# Load once at module level — avoids re-reading the file on every webhook call
+_lookup_table = None
+
+
+def _get_lookup_table() -> dict:
+    """Lazy-load the canonical lookup table."""
+    global _lookup_table
+    if _lookup_table is None:
+        _lookup_table = load_lookup_table("config/canonical_lookup.json")
+    return _lookup_table
 
 
 def _get_graph_client() -> JmlGraphClient:
@@ -71,7 +85,7 @@ async def handle(req: func.HttpRequest, starter: str) -> func.HttpResponse:
             mimetype="application/json",
         )
 
-    # Step 4: durable client for dispatching orchestrations
+    lookup = _get_lookup_table()
     client = df.DurableOrchestrationClient(starter)
 
     results = []
@@ -88,7 +102,11 @@ async def handle(req: func.HttpRequest, starter: str) -> func.HttpResponse:
             # Dispatch to the correct orchestration or skip
             orchestrator = _ORCHESTRATOR_MAP.get(action)
             if orchestrator:
-                instance_id = await client.start_new(orchestrator, None, mapped)
+                # Build a clean IdentityPayload, then serialise for the orchestrator
+                payload = build_identity_payload(mapped, lookup)
+                payload_dict = payload.to_dict()
+
+                instance_id = await client.start_new(orchestrator, None, payload_dict)
                 logger.info(
                     "Employee %s → %s — started %s (instance: %s)",
                     emp_id, action, orchestrator, instance_id,
