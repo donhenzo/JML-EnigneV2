@@ -16,8 +16,9 @@
     "JML_LEAVER_SOFT_DELETE_HOLD_DAYS": "1",
     "JML_PACKAGE_POLL_MAX_ATTEMPTS": "60",
     "JML_PACKAGE_POLL_INTERVAL_SECONDS": "5",
-    "BAMBOOHR_DOMAIN": "https://henzconsulting.bamboohr.com",
-    "BAMBOOHR_API_KEY": "edc44cdeb0779d5e8bf6d1645db537a000798259"
+    "BAMBOOHR_DOMAIN": "",
+    "BAMBOOHR_API_KEY": ""
+   
   }
 }
 
