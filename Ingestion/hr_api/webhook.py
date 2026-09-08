@@ -122,6 +122,14 @@ def _extract_employee_ids(body: dict) -> list[str]:
     """Pull employee IDs from whichever webhook shape arrives."""
     ids: list[str] = []
 
+    # Event-based webhook: {"type": "...", "data": {"employeeId": "4"}}
+    data = body.get("data")
+    if isinstance(data, dict):
+        emp_id = data.get("employeeId")
+        if emp_id is not None:
+            return [str(emp_id)]
+
+    # Standard webhook: {"employees": [{"id": "123"}, ...]}
     employees = body.get("employees")
     if isinstance(employees, list):
         for emp in employees:
@@ -130,6 +138,7 @@ def _extract_employee_ids(body: dict) -> list[str]:
                 ids.append(str(emp_id))
         return ids
 
+    # Single-event shorthand: {"employee_id": "123"}
     single = body.get("employee_id")
     if single is not None:
         return [str(single)]
