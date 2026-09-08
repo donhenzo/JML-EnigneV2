@@ -18,7 +18,7 @@ import azure.durable_functions as df
 from Ingestion.hr_api.bamboohr.bamboohr_client import get_employee
 from Ingestion.hr_api.bamboohr.bamboohr_mapper import map_to_raw_identity
 from Ingestion.hr_api.action_deriver import derive_action
-from Ingestion.hr_api.bamboohr.pipeline_adapter import build_identity_payload
+from Ingestion.hr_api.bamboohr.payload_builder import build_identity_payload
 from Normalization.lookup_loader import load_lookup_table
 from Provisioning.graph_client import build_graph_client, JmlGraphClient
 
