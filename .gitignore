@@ -27,4 +27,4 @@ local.settings.json
 Tests/
 Scripts/
 
-.python_packages
+.python_packagesConfig/hr_api_config.json

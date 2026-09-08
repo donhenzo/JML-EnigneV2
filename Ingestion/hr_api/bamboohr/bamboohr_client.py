@@ -23,7 +23,7 @@ from requests.exceptions import HTTPError, Timeout, ConnectionError
 logger = logging.getLogger(__name__)
 
 # Path to the credentials config file, relative to the project root.
-_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent.parent / "Config" / "hr_api_config.json"
+_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent.parent / "Config"/ "hr_api_config.json"
 
 # Fields fetched per individual employee call.
 # The directory endpoint only returns a subset — these additional fields
