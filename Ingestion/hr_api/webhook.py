@@ -32,7 +32,7 @@ from Ingestion.hr_api.bamboohr.last_state_store import (
     get_last_state_table_client,
     get_last_state,
 )
-from Ingestion.hr_api.bamboohr.pipeline_adapter import build_identity_payload
+from Ingestion.hr_api.bamboohr.payload_builder import build_identity_payload
 from Normalization.lookup_loader import load_lookup_table
 
 logger = logging.getLogger(__name__)
