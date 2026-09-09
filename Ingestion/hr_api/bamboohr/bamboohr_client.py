@@ -41,9 +41,11 @@ _INDIVIDUAL_FIELDS = [
     "department",
     "jobTitle",
     "employmentHistoryStatus",
+    "status",               # Active/Inactive — drives Leaver detection in action_deriver
     "location",
     "supervisorEId",        # numeric manager ID — NOT the name string from directory
     "hireDate",
+    "terminationDate",      # used as start_date for Leaver event IDs
 ]
 
 
