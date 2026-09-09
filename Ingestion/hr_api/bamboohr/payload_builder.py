@@ -86,6 +86,8 @@ def build_identity_payload(mapped: dict, lookup: dict) -> IdentityPayload:
         employee_id=employee_id,
         upn=mapped.get("upn", "unknown"),
         display_name=mapped.get("display_name", ""),
+        first_name=mapped.get("first_name", ""),
+        last_name=mapped.get("last_name", ""),
         department=mapped.get("department", "") if action_str != "Leaver" else None,
         job_title=mapped.get("job_title", "") if action_str != "Leaver" else None,
         manager_id=mapped.get("manager_id") or None,

@@ -87,6 +87,8 @@ def map_to_raw_identity(bamboohr_record: dict) -> dict:
         "bamboohr_id":      bamboohr_id,
         "upn":              bamboohr_record.get("workEmail") or "",
         "display_name":     display_name,
+        "first_name":       first,
+        "last_name":        last,
         "department":       bamboohr_record.get("department") or "",
         "job_title":        bamboohr_record.get("jobTitle") or "",
         "employment_type":  bamboohr_record.get("employmentHistoryStatus") or "",

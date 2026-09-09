@@ -417,6 +417,8 @@ class JmlGraphClient:
 
         body = {
             "displayName":       payload.display_name,
+            "givenName":         payload.first_name,
+            "surname":           payload.last_name,
             "userPrincipalName": payload.upn,
             "mailNickname":      payload.upn.split("@")[0],
             "accountEnabled":    True,

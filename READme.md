@@ -141,16 +141,17 @@ The pre-flight queries Entra's `incompatibleAccessPackages` for each package a M
 
 ```mermaid
 flowchart TD
-    HR["HR Source<br/>BambooHR · CSV · HTTP"]
+    HR["HR Source<br/>BambooHR webhook · CSV · HTTP"]
 
     subgraph ENGINE["JML Engine"]
+        LS["Last-State Deriver<br/>compare against JmlLastState"]
         CI["Canonical Identity"]
         ER["Entitlement Resolution<br/>Joiner: resolve · Mover: delta"]
         PRE["PreProvision Governance<br/>in-process, blocks"]
-        CI --> ER --> PRE
+        LS --> CI --> ER --> PRE
     end
 
-    HR --> CI
+    HR --> LS
     PRE -->|Pass| MG["Microsoft Graph"]
     PRE -->|Fail| HOLD["Hold Queue"]
 
@@ -164,6 +165,7 @@ flowchart TD
     POLL --> POST["PostProvision Governance<br/>reads memberOf, records"]
     POST --> VERIFY["Tenant State Verification"]
     VERIFY --> AUDIT["Audit"]
+    AUDIT --> LSW["Write JmlLastState<br/>on success only"]
     HOLD --> AUDIT
 ```
 
@@ -227,7 +229,11 @@ The important part is that this is not only a policy simulation. The workflows e
 * SHA-256 event identity and atomic event claiming
 * Per-event audit records (written once by the engine; storage-enforced immutability planned)
 * Durable Functions orchestration for the Joiner, Mover, and Leaver (timer-driven entitlement polling)
-* BambooHR ingestion
+* BambooHR webhook ingestion — real-time lifecycle events from BambooHR
+* Last-state-driven action classification — compares incoming HR record against the last successfully reconciled state (no Entra Graph call needed)
+* JmlLastState store (Azure Table Storage) with write-on-success semantic — orchestrators write back only after confirmed pipeline completion
+* Bootstrap seeding — one-time population of JmlLastState from BambooHR directory for go-live baseline
+* Rehire detection — terminated rows are retained (not deleted), so a returning employee is correctly classified as a Joiner
 * CSV offline execution
 * Direct HTTP lifecycle event ingestion
 * SCIM provisioning to AWS IAM Identity Center
@@ -284,7 +290,13 @@ The important part is that this is not only a policy simulation. The workflows e
 * **Platform-level Separation of Duties via Access Package incompatibilities — configured and proven**
 * **Group-anchored SoD catalogue and GUID-keyed governance model**
 * **Mover pre-flight blocking SoD (ADR-011) — queries live Entra incompatibility before adds; proven choosing add, remove-first, and block correctly on the live tenant**
-* BambooHR ingestion
+* BambooHR ingestion (CSV and direct API)
+* **BambooHR webhook ingestion — real-time lifecycle events dispatched to durable orchestrators**
+* **Last-state store (JmlLastState) — Azure Table Storage holding the last successfully reconciled HR state per employee**
+* **Last-state deriver — classifies webhook events as Joiner / Mover / Leaver / Skip by comparing against JmlLastState, replacing the Entra-based deriver (no Graph API call needed)**
+* **Orchestrator write-back — each orchestrator writes the mapped record to JmlLastState on successful completion (write-on-success, not write-on-dispatch)**
+* **Bootstrap seed script — one-time population of JmlLastState from BambooHR directory for go-live baseline (87 employees seeded)**
+* **Rehire detection — terminated employee rows retained in JmlLastState so a returning employee derives Joiner**
 * CSV execution
 * Direct HTTP lifecycle events
 * AWS IAM Identity Center SCIM integration
@@ -293,11 +305,9 @@ The important part is that this is not only a policy simulation. The workflows e
 
 ### In Progress / Planned
 
+* Webhook-layer idempotency + HMAC signature verification
 * Reviewable Mover hold queue with release/resume — pre-flight BLOCK events currently write to an in-memory hold store, not a persistent, reviewable queue
 * Standalone Validation Engine as continuous, tenant-wide evaluation (scheduled scanner)
-* `employment_status` field + action-deriver Leaver rule
-* Last-state store for webhook-driven lifecycle processing
-* BambooHR webhook ingestion
 * Event-store recovery/reclaim for failed events
 * Reconciliation pipeline (event repair; also the home for automated remediation of detected drift)
 * Resumable recovery for a partially failed Leaver (the deferred-delete path is built; broader mid-run resume is not)
@@ -342,7 +352,18 @@ The same pattern is available for:
 
 Each pipeline additionally exposes a Durable Functions endpoint — `/api/joiner-durable`, `/api/mover-durable`, and `/api/leaver-durable` — which returns `202 Accepted` with a status URL and runs the pipeline as an orchestration. The synchronous `/api/joiner`, `/api/mover`, and `/api/leaver` endpoints remain available.
 
-This provides the interface required for eventual HR webhook integration.
+### BambooHR Webhook
+
+The `/api/webhook_bamboohr` endpoint receives BambooHR webhook events, fetches the full employee record, maps it to the canonical identity shape, and classifies the lifecycle action by comparing against the last reconciled state in JmlLastState — no Entra Graph call needed. The correct durable orchestrator (Joiner, Mover, or Leaver) is dispatched automatically. Each orchestrator writes the mapped record back to JmlLastState on successful completion, keeping the store current for the next webhook.
+
+The webhook accepts multiple payload shapes: event-based (`{"data": {"employeeId": "..."}}`), standard (`{"employees": [{"id": "..."}]}`), and single-event shorthand (`{"employee_id": "..."}`).
+
+```bash
+curl -X POST \
+  "https://<function-app>.azurewebsites.net/api/webhook_bamboohr?code=<function-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"employees": [{"id": "123"}]}'
+```
 
 ---
 

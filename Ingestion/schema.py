@@ -54,6 +54,8 @@ class IdentityPayload:
     employee_id: str                           # Unique HR source identifier
     upn: str                                   # User principal name — constructed or provided
     display_name: str                          # Normalized full name
+    first_name: str = ""                       # Given name — flows to Entra givenName
+    last_name: str = ""                        # Surname — flows to Entra surname
     department: Optional[str]                  # Normalized via canonical lookup; None = unresolved
     job_title: Optional[str]                   # Normalized via canonical lookup; None = unresolved
     start_date: date                           # ISO 8601 — enforced as a date object, not a string
@@ -116,6 +118,8 @@ class IdentityPayload:
             "employee_id":     self.employee_id,
             "upn":             self.upn,
             "display_name":    self.display_name,
+            "first_name":      self.first_name,
+            "last_name":       self.last_name,
             "department":      self.department,
             "job_title":       self.job_title,
             "manager_id":      self.manager_id,
@@ -140,6 +144,8 @@ class IdentityPayload:
             employee_id=     raw["employee_id"],
             upn=             raw["upn"],
             display_name=    raw["display_name"],
+            first_name=      raw.get("first_name", ""),
+            last_name=       raw.get("last_name", ""),
             department=      raw.get("department"),
             job_title=       raw.get("job_title"),
             manager_id=      raw.get("manager_id"),
