@@ -54,8 +54,8 @@ class IdentityPayload:
     employee_id: str                           # Unique HR source identifier
     upn: str                                   # User principal name — constructed or provided
     display_name: str                          # Normalized full name
-    first_name: str = ""                       # Given name — flows to Entra givenName
-    last_name: str = ""                        # Surname — flows to Entra surname
+    first_name: str                            # Given name — flows to Entra givenName
+    last_name: str                             # Surname — flows to Entra surname
     department: Optional[str]                  # Normalized via canonical lookup; None = unresolved
     job_title: Optional[str]                   # Normalized via canonical lookup; None = unresolved
     start_date: date                           # ISO 8601 — enforced as a date object, not a string
