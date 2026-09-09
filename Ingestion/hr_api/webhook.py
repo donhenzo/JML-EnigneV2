@@ -1,26 +1,39 @@
 """
 Ingestion/hr_api/webhook.py
 
-Steps 1–4 — Webhook receive → fetch → map → derive → dispatch.
+Webhook receive → fetch → map → derive (last-state) → dispatch.
 
 Receives a BambooHR webhook, fetches the full record, maps it,
-derives the lifecycle action, builds a clean IdentityPayload via the
-shared builder, and starts the correct durable orchestration
-(Joiner / Mover / Leaver). Skips are logged only.
+derives the lifecycle action by comparing against the last reconciled
+state in JmlLastState, builds a clean IdentityPayload, and starts the
+correct durable orchestration (Joiner / Mover / Leaver).
+
+The last-state deriver replaces the Entra-based deriver — no Graph API
+calls are needed to classify the action. The last state is read from
+Azure Table Storage, which was seeded by bootstrap_last_state.py and is
+kept current by the orchestrators on successful completion.
+
+The mapped record is passed alongside the payload so the orchestrator
+can write it back to JmlLastState after success — the webhook does NOT
+write to the last-state store (write on success, not on dispatch).
 """
 
 import json
 import logging
+import os
 
 import azure.functions as func
 import azure.durable_functions as df
 
 from Ingestion.hr_api.bamboohr.bamboohr_client import get_employee
 from Ingestion.hr_api.bamboohr.bamboohr_mapper import map_to_raw_identity
-from Ingestion.hr_api.action_deriver import derive_action
-from Ingestion.hr_api.bamboohr.payload_builder import build_identity_payload
+from Ingestion.hr_api.bamboohr.last_state_deriver import derive_action
+from Ingestion.hr_api.bamboohr.last_state_store import (
+    get_last_state_table_client,
+    get_last_state,
+)
+from Ingestion.hr_api.bamboohr.pipeline_adapter import build_identity_payload
 from Normalization.lookup_loader import load_lookup_table
-from Provisioning.graph_client import build_graph_client, JmlGraphClient
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +44,9 @@ _ORCHESTRATOR_MAP = {
     "Leaver": "leaver_durable_orchestrator",
 }
 
-# Load once at module level — avoids re-reading the file on every webhook call
+# Lazy-loaded shared resources — built once per Function App instance
 _lookup_table = None
+_last_state_client = None
 
 
 def _get_lookup_table() -> dict:
@@ -43,10 +57,13 @@ def _get_lookup_table() -> dict:
     return _lookup_table
 
 
-def _get_graph_client() -> JmlGraphClient:
-    """Build a Graph client for Entra ID lookups during action derivation."""
-    graph_service_client, credential = build_graph_client()
-    return JmlGraphClient(graph_service_client, credential)
+def _get_last_state_client():
+    """Lazy-load the JmlLastState table client."""
+    global _last_state_client
+    if _last_state_client is None:
+        conn = os.environ.get("JML_STORAGE_CONNECTION_STRING", "")
+        _last_state_client = get_last_state_table_client(conn)
+    return _last_state_client
 
 
 async def handle(req: func.HttpRequest, starter: str) -> func.HttpResponse:
@@ -75,17 +92,8 @@ async def handle(req: func.HttpRequest, starter: str) -> func.HttpResponse:
         employee_ids,
     )
 
-    try:
-        graph_client = _get_graph_client()
-    except Exception as e:
-        logger.error("Failed to build Graph client: %s", e)
-        return func.HttpResponse(
-            json.dumps({"error": f"Graph client init failed: {e}"}),
-            status_code=500,
-            mimetype="application/json",
-        )
-
     lookup = _get_lookup_table()
+    last_state_client = _get_last_state_client()
     client = df.DurableOrchestrationClient(starter)
 
     results = []
@@ -95,18 +103,29 @@ async def handle(req: func.HttpRequest, starter: str) -> func.HttpResponse:
             raw = get_employee(emp_id)
             mapped = map_to_raw_identity(raw)
 
-            # Derive action
-            action = derive_action(mapped, graph_client)
+            employee_id = mapped.get("employee_id", emp_id)
+
+            # Derive action from last state — no Entra call needed
+            last_state = get_last_state(last_state_client, employee_id)
+            action = derive_action(mapped, last_state)
             mapped["action"] = action
 
             # Dispatch to the correct orchestration or skip
             orchestrator = _ORCHESTRATOR_MAP.get(action)
             if orchestrator:
-                # Build a clean IdentityPayload, then serialise for the orchestrator
                 payload = build_identity_payload(mapped, lookup)
                 payload_dict = payload.to_dict()
 
-                instance_id = await client.start_new(orchestrator, None, payload_dict)
+                # Pass the mapped record alongside the payload so the
+                # orchestrator can write it to JmlLastState on success.
+                orchestrator_input = {
+                    "payload": payload_dict,
+                    "mapped_record": mapped,
+                }
+
+                instance_id = await client.start_new(
+                    orchestrator, None, orchestrator_input,
+                )
                 logger.info(
                     "Employee %s → %s — started %s (instance: %s)",
                     emp_id, action, orchestrator, instance_id,

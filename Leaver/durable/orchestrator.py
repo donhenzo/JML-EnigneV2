@@ -45,7 +45,16 @@ def _run_poll_loop(context, state):
 
 
 def orchestrator_function(context: df.DurableOrchestrationContext):
-    payload_dict = context.get_input()
+    raw_input = context.get_input()
+
+    # Unwrap — webhook sends {"payload": {...}, "mapped_record": {...}},
+    # HTTP starters send a flat payload dict.
+    if "payload" in raw_input and "mapped_record" in raw_input:
+        payload_dict = raw_input["payload"]
+        mapped_record = raw_input["mapped_record"]
+    else:
+        payload_dict = raw_input
+        mapped_record = None
 
     pre = yield context.call_activity("leaver_pre_activity", payload_dict)
     if pre["final_status"] in TERMINAL_EARLY_EXITS:
@@ -68,6 +77,16 @@ def orchestrator_function(context: df.DurableOrchestrationContext):
             context.current_utc_datetime + _seconds(result["hold_seconds"])
         )
         result = yield context.call_activity("leaver_deferred_delete_activity", result)
+
+    # Write the mapped record to JmlLastState on success.
+    # Uses mark_terminated via action="Leaver" — the row stays so
+    # a future webhook for a rehired employee derives "Joiner".
+    if mapped_record:
+        yield context.call_activity("save_last_state_activity", {
+            "mapped_record": mapped_record,
+            "employee_id": mapped_record.get("employee_id", "unknown"),
+            "action": "Leaver",
+        })
 
     return result
 
