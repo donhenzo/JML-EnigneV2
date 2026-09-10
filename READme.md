@@ -4,7 +4,7 @@ Governance-first Joiner, Mover, and Leaver automation for **Microsoft Entra ID**
 
 The engine turns HR lifecycle events into governed access changes. It resolves policy into **Access Packages**, evaluates governance before provisioning, orchestrates entitlement delivery, and verifies the resulting tenant state.
 
-The complete **Joiner → Mover → Leaver** lifecycle has been tested end-to-end against a live Entra tenant, including downstream provisioning to **AWS IAM Identity Center through SCIM**.
+The complete **Joiner → Mover → Leaver** lifecycle has been exercised end-to-end against a live Entra tenant, including downstream provisioning to **AWS IAM Identity Center through SCIM**.
 
 > **Core principle:** Governance decides whether access is allowed to happen. The engine validates the request before making identity or access changes, rather than provisioning first and checking afterwards — and it verifies the resulting state after delivery.
 
@@ -31,30 +31,13 @@ flowchart TD
 
 Entitlements are resolved from policy using attributes such as department, job title, and employment type. The resulting Access Packages can deliver access to Microsoft 365 resources and downstream applications through SCIM.
 
-The Joiner runs as an Azure Durable Functions orchestration: the HTTP call returns immediately, and entitlement delivery is polled through durable timers rather than a blocking wait. This removes the gateway-timeout ceiling on long deliveries — a Joiner whose packages take several minutes to deliver completes cleanly instead of being cut off.
+The Joiner runs as an Azure Durable Functions orchestration: the HTTP call returns immediately, and entitlement delivery is polled through durable timers rather than a blocking wait. This removes the gateway-timeout ceiling on long deliveries.
 
 ### Mover
 
-A Mover does not rebuild access from scratch.
+A Mover does not rebuild access from scratch. The engine reads the user's current Access Package assignments, resolves the target entitlements, calculates the access delta, evaluates retention requirements, and runs a pre-flight Separation of Duties check against live Entra incompatibility configuration — then adds new access first or removes a conflicting package first, depending on what the pre-flight determined is safe.
 
-The engine:
-
-1. Reads the user's current Access Package assignments.
-2. Resolves the target entitlements.
-3. Calculates the access delta.
-4. Evaluates retention requirements.
-5. Runs a pre-flight Separation of Duties check against live Entra incompatibility configuration.
-6. Adds new access first — or removes a conflicting package first, if the pre-flight determined that's the safe order.
-7. Waits for delivery.
-8. Removes obsolete access.
-9. Updates identity attributes.
-10. Verifies the resulting tenant state (including PostProvision governance).
-
-The critical property is **add-before-remove, unless the pre-flight determines a specific conflicting package must be removed first** to avoid a platform rejection.
-
-If the new access cannot be delivered, the old access is not removed.
-
-The Mover runs as an Azure Durable Functions orchestration. Like the Joiner, the HTTP call returns immediately and both the addition and removal deliveries are polled through durable timers rather than blocking waits — so a role change whose packages take several minutes to deliver completes cleanly instead of being cut off at the gateway timeout. The add-before-remove gate lives in the orchestrator: removals and the attribute update run only after every addition is confirmed delivered. The pre-flight SoD check runs before either sequence begins, and its decision (add-first, remove-first, or block) determines which path the orchestrator takes.
+The critical property is **add-before-remove, unless the pre-flight determines a specific conflicting package must be removed first** to avoid a platform rejection. If the new access cannot be delivered, the old access is not removed.
 
 ```mermaid
 flowchart LR
@@ -72,11 +55,11 @@ flowchart LR
     GATE -->|No| DEFER["Defer removals<br/>+ attribute update"] --> VER
 ```
 
+The Mover runs as an Azure Durable Functions orchestration. Both the addition and removal deliveries are polled through durable timers, and the add-before-remove gate lives in the orchestrator: removals and the attribute update run only after every addition is confirmed delivered.
+
 ### Leaver
 
-Offboarding follows a different safety model.
-
-The account is disabled and sessions are revoked **before** access cleanup begins.
+Offboarding follows a different safety model. The account is disabled and sessions are revoked **before** access cleanup begins.
 
 ```mermaid
 flowchart TD
@@ -90,13 +73,11 @@ flowchart TD
     VO --> AUD["Audit"]
 ```
 
-The Leaver does not attempt to calculate what the user *should* have. It removes what the user currently holds. It has no governance gate — removal is always the safe direction.
+The Leaver does not attempt to calculate what the user *should* have. It removes what the user currently holds. There is no entitlement-resolution governance gate — removal is always the safe direction. (The trust boundary is secured at the ingestion layer; HMAC signature verification is planned.)
 
 This makes the workflow fail-safe: if a downstream cleanup operation fails, the account has already been prevented from authenticating.
 
-The Leaver runs as an Azure Durable Functions orchestration. Because offboarding is all-removal, every package removal is polled through durable timers rather than a blocking wait — so an offboarding whose removals take several minutes completes cleanly instead of being cut off at the gateway timeout. The disable and session revocation run first, inside the pre-removal stage, so the fail-safe holds regardless of how the rest of the run proceeds. There is one removal poll loop and no add-before-remove gate, which makes the Leaver orchestration simpler than the Mover's.
-
-Soft delete is subject to a configurable hold (`JML_LEAVER_SOFT_DELETE_HOLD_DAYS`). When the hold is zero the user is deleted immediately; when it is nonzero the deletion is deferred and completed later by a durable timer — the orchestration sleeps out the hold, then re-checks the account is still disabled before deleting, so a re-hire reusing the same UPN during the hold is not clobbered. Everything before the delete has already locked the account out and stripped its access, so the delay is safe.
+Soft delete is subject to a configurable hold (`JML_LEAVER_SOFT_DELETE_HOLD_DAYS`). When the hold is zero the user is deleted immediately; when it is nonzero the deletion is deferred and completed later by a durable timer — the orchestration sleeps out the hold, then re-checks the account is still disabled before deleting, so a rehire reusing the same UPN during the hold is not clobbered.
 
 ---
 
@@ -104,11 +85,11 @@ Soft delete is subject to a configurable hold (`JML_LEAVER_SOFT_DELETE_HOLD_DAYS
 
 The engine separates **policy**, **governance**, and **execution**. Policy defines which entitlements an identity should receive; governance evaluates whether the request and the resulting state are permissible; execution writes to the tenant.
 
-Governance runs **in-process** inside the JML engine as two evaluation points — it is not a separate service or an HTTP call. Each is a small, event-relevant check: a lifecycle event supplies attributes and (post-delivery) real group memberships, and the check reasons about *this* identity, not the whole tenant. Tenant-wide, continuous scanning (RBAC, cross-plane exposure, MFA, hygiene, inactivity) is deliberately **out of scope** for the in-engine gate and belongs to the standalone Validation Engine (see Related Projects).
+Governance runs **in-process** inside the JML engine as two evaluation points — it is not a separate service or an HTTP call. Tenant-wide continuous scanning (RBAC, cross-plane exposure, MFA, hygiene, inactivity) is deliberately out of scope for the in-engine gate and belongs to the standalone Validation Engine (see Related Projects).
 
 ### Two governance points, two different jobs
 
-**PreProvision — preventive, blocks.** Before any Graph write, the canonical payload is evaluated on attributes alone (employment type vs job title, UPN format, employment status) with zero Graph calls. A failure **blocks** the event — the identity is never created, the record is held. This is the fail-closed gate.
+**PreProvision — preventive, blocks.** Before any Graph write, the canonical payload is evaluated on attributes alone (employment type vs job title, UPN format, employment status) with zero Graph calls. A failure blocks the event — the identity is never created, the record is held.
 
 ```mermaid
 flowchart TD
@@ -119,21 +100,21 @@ flowchart TD
     PRE -->|Fail| HQ["Hold Queue"]
 ```
 
-**PostProvision — detective, records.** After delivery, the check reads the identity's real group memberships (`memberOf`) and evaluates them against the entitlement model (employment type vs the tier/privilege classification of each group actually held) and against the Separation of Duties catalogue. Because the access already exists by this point, PostProvision **does not block or un-grant** — it *records* findings for review. On the Mover a finding produces `MOVE_PARTIAL` with the reason captured in the audit record. This is the detective backstop that catches what preventive controls cannot: drift, direct-assignment conflicts, and Warn-level SoD.
+**PostProvision — detective, records.** After delivery, the check reads the identity's real group memberships (`memberOf`) and evaluates them against the entitlement model and against the Separation of Duties catalogue. Because the access already exists by this point, PostProvision does not block or un-grant — it records findings for review. On the Mover a finding produces `MOVE_PARTIAL` with the reason captured in the audit record.
 
-A failed **PreProvision** Joiner or Mover therefore does not create an identity or modify access. A **PostProvision** finding is surfaced and recorded, not silently dropped and not auto-remediated.
+A failed PreProvision therefore does not create an identity or modify access. A PostProvision finding is surfaced and recorded, not silently dropped and not auto-remediated.
 
 ### Separation of Duties — layered
 
 | Layer | When | Behaviour | Status |
 | --- | --- | --- | --- |
-| Platform incompatibility (Entra) | at assignment | Entra rejects a conflicting `adminAdd` on any provisioning path | Configured & proven |
-| Mover pre-flight (ADR-011) | before adds, in-engine | queries live Entra incompatibility configuration; reorders (remove-first) for a legitimate transition or blocks a genuine conflict | Built & proven |
-| PostProvision detective | after delivery | records SoD conflicts (including direct-assignment drift) for review | Built & proven |
+| Platform incompatibility (Entra) | at assignment | Entra rejects a conflicting `adminAdd` on any provisioning path | Configured and verified |
+| Mover pre-flight (ADR-011) | before adds, in-engine | Queries live Entra incompatibility configuration; reorders (remove-first) for a legitimate transition or blocks a genuine conflict | Built and verified |
+| PostProvision detective | after delivery | Records SoD conflicts (including direct-assignment drift) for review | Built and verified |
 
-The Separation of Duties catalogue is **group-anchored** — conflicts are authored once against real group object IDs, and platform incompatibility is derived from that. Blocking SoD is the platform's and the pre-flight's job; the in-engine PostProvision layer is detective and does not block.
+The SoD catalogue is **group-anchored** — conflicts are authored once against real group object IDs, and platform incompatibility is derived from that.
 
-The pre-flight queries Entra's `incompatibleAccessPackages` for each package a Mover would add, and classifies the result three ways: **add normally** if nothing held conflicts; **remove the conflicting package first, then add** if the conflict is with something already being removed as part of the same role change (a legitimate transition — the old, conflicting access is leaving anyway); or **block the event and hold it for review** if the conflict is with something the user is keeping. This is what lets a real role change — one that momentarily looks incompatible mid-transition — complete cleanly instead of being rejected by the platform, while a genuine attempt to hold two conflicting duties at once is stopped before any write.
+The pre-flight queries Entra's `incompatibleAccessPackages` for each package a Mover would add, and classifies the result three ways: **add normally** if nothing held conflicts; **remove the conflicting package first, then add** if the conflict is with something already being removed (a legitimate transition); or **block the event and hold it for review** if the conflict is with something the user is keeping.
 
 ---
 
@@ -169,99 +150,95 @@ flowchart TD
     HOLD --> AUDIT
 ```
 
-The execution layer is deliberately separated from the governance decision, and governance is co-located with the orchestration that acts on it (no cross-service HTTP boundary).
+The execution layer is deliberately separated from the governance decision, and governance is co-located with the orchestration (no cross-service HTTP boundary).
 
-### Execution Model — Durable Migration Status
+### Execution Model
 
-Long-running entitlement delivery runs on Azure Durable Functions, so that polling waits are orchestrator-driven timers rather than blocking calls bound by the HTTP gateway timeout. All three pipelines are migrated:
+All three pipelines run on Azure Durable Functions. Polling waits are orchestrator-driven timers rather than blocking calls bound by the HTTP gateway timeout.
 
 | Pipeline   | Execution Model                          | Status      |
 | ---------- | ---------------------------------------- | ----------- |
-| **Joiner** | Durable Functions — timer-driven polling | ✅ Complete  |
-| **Mover**  | Durable Functions — timer-driven polling, pre-flight SoD branch | ✅ Complete  |
-| **Leaver** | Durable Functions — timer-driven polling | ✅ Complete  |
+| **Joiner** | Durable Functions — timer-driven polling | Complete  |
+| **Mover**  | Durable Functions — timer-driven polling, pre-flight SoD branch | Complete  |
+| **Leaver** | Durable Functions — timer-driven polling | Complete  |
 
-Each pipeline also retains a synchronous execution path, used by the CSV/local runner alongside its HTTP entry point.
+Each pipeline also retains a synchronous execution path for the CSV/local runner and its HTTP entry point.
 
 ---
 
-## Proven End-to-End
+## Verified End-to-End
 
 The lifecycle has been exercised against a live Entra tenant.
 
-| Lifecycle             | Result                                                              |
-| --------------------- | ------------------------------------------------------------------ |
-| **Joiner**            | Identity created and Access Packages delivered                     |
-| **Mover**             | New access added, old access removed, attributes updated           |
-| **Leaver**            | Account disabled, sessions revoked, packages removed               |
+| Scenario | Result |
+| --- | --- |
+| **Joiner** | Identity created, Access Packages delivered |
+| **Mover** | New access added, old access removed, attributes updated |
+| **Leaver** | Account disabled, sessions revoked, packages removed |
 | **PreProvision gate** | Contractor targeting a management-tier role blocked before any write |
-| **PostProvision gate**| Contractor in a restricted duty group detected and recorded post-delivery |
-| **Platform SoD**      | Conflicting Access Package assignment denied by Entra at request time |
-| **Mover pre-flight — remove-first** | A legitimate role transition into a conflicting duty correctly removed the old package, confirmed delivery, then added the new one — no platform rejection |
-| **Mover pre-flight — block** | A role change that would have kept one conflicting package while adding another was held for review before any write, with the conflicting pair named in the audit record |
-| **AWS SCIM**          | Groups and users provisioned to AWS IAM Identity Center            |
-| **AWS authorization** | Permission Set assignment and EC2 access verified                  |
-| **M365**              | Native group-based Teams/SharePoint access verified               |
-
-The important part is that this is not only a policy simulation. The workflows execute against the real Entra tenant and verify the resulting state.
+| **PostProvision gate** | Contractor in a restricted duty group detected and recorded post-delivery |
+| **Platform SoD** | Conflicting Access Package assignment denied by Entra at request time |
+| **Mover pre-flight — remove-first** | Legitimate role transition correctly removed the old conflicting package, confirmed delivery, then added the new one |
+| **Mover pre-flight — block** | Role change that would hold two conflicting duties was held for review before any write |
+| **AWS SCIM** | Groups and users provisioned to AWS IAM Identity Center |
+| **AWS authorization** | Permission Set assignment and EC2 access verified |
+| **M365** | Group-based Teams/SharePoint access verified |
 
 ---
 
 ## Key Features
 
-* Governance-first Joiner, Mover, and Leaver automation
-* In-process governance: PreProvision (preventive, blocks) and PostProvision (detective, records)
-* Microsoft Entra Entitlement Management Access Packages
-* Policy-driven entitlement resolution using JSON configuration
-* Group-anchored Separation of Duties catalogue
-* Platform-level SoD enforcement via Access Package incompatibilities
-* Mover pre-flight SoD check — queries live incompatibility configuration and chooses add, remove-first, or block per package
-* Add-before-remove Mover sequencing (with pre-flight-driven remove-first override for conflicting packages)
-* Disable-before-remove Leaver sequencing
-* Active PIM session termination during offboarding
-* Configurable soft-delete hold with durable-timer deferred deletion (re-hire-safe)
-* Managed and unmanaged Access Package detection
-* Retention-aware Mover processing
-* Leaver supersedes conflicting pending lifecycle events
-* Post-provision tenant-state verification
-* Post-offboarding verification
-* Deterministic and idempotent event processing
-* SHA-256 event identity and atomic event claiming
-* Per-event audit records (written once by the engine; storage-enforced immutability planned)
-* Durable Functions orchestration for the Joiner, Mover, and Leaver (timer-driven entitlement polling)
-* BambooHR webhook ingestion — real-time lifecycle events from BambooHR
-* Last-state-driven action classification — compares incoming HR record against the last successfully reconciled state (no Entra Graph call needed)
-* JmlLastState store (Azure Table Storage) with write-on-success semantic — orchestrators write back only after confirmed pipeline completion
-* Bootstrap seeding — one-time population of JmlLastState from BambooHR directory for go-live baseline
-* Rehire detection — terminated rows are retained (not deleted), so a returning employee is correctly classified as a Joiner
-* CSV offline execution
-* Direct HTTP lifecycle event ingestion
-* SCIM provisioning to AWS IAM Identity Center
-* Native Microsoft 365 group-based access
-* GitHub Actions CI/CD
-* OIDC authentication between GitHub and Azure
-* Azure Table Storage for state and audit data
+**Governance and Controls**
+- In-process PreProvision gate (preventive, blocks) and PostProvision gate (detective, records)
+- Group-anchored Separation of Duties catalogue with three enforcement layers
+- Mover pre-flight SoD — queries live Entra incompatibility configuration before any write
+- Add-before-remove Mover sequencing with pre-flight-driven remove-first override
+- Disable-before-remove Leaver sequencing
+- Post-provision and post-offboarding tenant-state verification
+- Deterministic and idempotent event processing (SHA-256 event identity, atomic claiming)
+
+**Lifecycle Orchestration**
+- Durable Functions orchestration for all three pipelines (timer-driven delivery polling)
+- Policy-driven entitlement resolution using JSON configuration
+- Retention-aware Mover processing
+- Active PIM session termination during offboarding
+- Configurable soft-delete hold with durable-timer deferred deletion (rehire-safe)
+- Leaver supersedes conflicting pending lifecycle events
+- Managed and unmanaged Access Package detection
+- Per-event audit records
+
+**Ingestion and State**
+- BambooHR webhook ingestion — real-time lifecycle events dispatched to durable orchestrators
+- Last-state-driven action classification — compares incoming HR record against the last reconciled state (no Graph API call needed)
+- JmlLastState store (Azure Table Storage) with write-on-success semantic
+- Bootstrap seeding for go-live baseline population
+- Rehire detection — terminated rows retained so a returning employee is correctly classified
+- CSV offline execution and direct HTTP ingestion
+
+**Cross-Cloud**
+- SCIM provisioning to AWS IAM Identity Center
+- Microsoft 365 group-based access
+- OIDC authentication between GitHub and Azure
 
 ---
 
 ## Technology
 
-| Layer                   | Technology                                         |
-| ----------------------- | -------------------------------------------------- |
-| Runtime                 | Python 3.11                                        |
-| Compute                 | Azure Functions — Flex Consumption                 |
-| Orchestration           | Azure Durable Functions (Joiner, Mover, Leaver)    |
-| Identity                | Microsoft Entra ID                                 |
-| API                     | Microsoft Graph                                    |
-| Governance              | In-process (Python) — PreProvision + PostProvision |
-| Continuous validation   | PowerShell Azure Function (standalone scanner)     |
-| Authorization           | Access Packages + Entra incompatibility (SoD) + Mover pre-flight |
-| Downstream provisioning | SCIM / Microsoft 365 groups                        |
-| Cloud                   | Microsoft Azure + AWS                              |
-| Storage                 | Azure Table Storage                                |
-| HR Source               | BambooHR                                           |
-| Authentication          | OIDC / Microsoft Graph client credentials          |
-| CI/CD                   | GitHub Actions                                     |
+| Layer | Technology |
+| --- | --- |
+| Runtime | Python 3.11 |
+| Compute | Azure Functions (Flex Consumption) |
+| Orchestration | Azure Durable Functions |
+| Identity | Microsoft Entra ID |
+| API | Microsoft Graph |
+| Governance | In-process Python — PreProvision + PostProvision |
+| Authorization | Access Packages, Entra incompatibility (SoD), Mover pre-flight |
+| Downstream provisioning | SCIM, Microsoft 365 groups |
+| Cloud | Microsoft Azure, AWS |
+| State / Audit | Azure Table Storage |
+| HR Source | BambooHR (webhook + API + CSV) |
+| Authentication | OIDC, Graph client credentials |
+| CI/CD | GitHub Actions |
 
 ---
 
@@ -269,60 +246,34 @@ The important part is that this is not only a policy simulation. The workflows e
 
 ### Completed
 
-* Joiner provisioning
-* Mover access-package delta processing
-* Leaver offboarding
-* Full Joiner → Mover → Leaver lifecycle
-* Access Package provisioning
-* Add-before-remove Mover protection
-* Leaver disable/revoke-before-removal
-* PIM session termination
-* Retention evaluation
-* Unmanaged access detection
-* Event idempotency and concurrency control
-* Conflict handling and Leaver supersede
-* Tenant-state verification
-* Per-event audit reporting
-* Durable Functions execution for the Joiner, Mover, and Leaver (timer-driven entitlement polling)
-* Deferred soft-delete completion via durable timer (re-hire-safe)
-* **In-process PreProvision governance gate (preventive, blocks) — proven on tenant**
-* **In-process PostProvision governance gate (detective, records; reads real memberOf) — proven on tenant**
-* **Platform-level Separation of Duties via Access Package incompatibilities — configured and proven**
-* **Group-anchored SoD catalogue and GUID-keyed governance model**
-* **Mover pre-flight blocking SoD (ADR-011) — queries live Entra incompatibility before adds; proven choosing add, remove-first, and block correctly on the live tenant**
-* BambooHR ingestion (CSV and direct API)
-* **BambooHR webhook ingestion — real-time lifecycle events dispatched to durable orchestrators**
-* **Last-state store (JmlLastState) — Azure Table Storage holding the last successfully reconciled HR state per employee**
-* **Last-state deriver — classifies webhook events as Joiner / Mover / Leaver / Skip by comparing against JmlLastState, replacing the Entra-based deriver (no Graph API call needed)**
-* **Orchestrator write-back — each orchestrator writes the mapped record to JmlLastState on successful completion (write-on-success, not write-on-dispatch)**
-* **Bootstrap seed script — one-time population of JmlLastState from BambooHR directory for go-live baseline (87 employees seeded)**
-* **Rehire detection — terminated employee rows retained in JmlLastState so a returning employee derives Joiner**
-* CSV execution
-* Direct HTTP lifecycle events
-* AWS IAM Identity Center SCIM integration
-* Microsoft 365 group-based access
-* Azure deployment through GitHub Actions
+**Core lifecycle:** Joiner provisioning, Mover access-package delta processing, Leaver offboarding, full Joiner → Mover → Leaver lifecycle exercised end-to-end.
+
+**Governance:** In-process PreProvision gate (preventive, blocks), in-process PostProvision gate (detective, reads real `memberOf`), platform-level SoD via Access Package incompatibilities, group-anchored SoD catalogue, Mover pre-flight SoD (ADR-011) — all verified on tenant.
+
+**Orchestration:** Durable Functions execution for all three pipelines, add-before-remove Mover protection, disable/revoke-before-removal Leaver sequencing, PIM session termination, retention evaluation, deferred soft-delete with rehire safety, unmanaged access detection, event idempotency and concurrency control, conflict handling and Leaver supersede, tenant-state verification, per-event audit reporting.
+
+**Ingestion:** BambooHR webhook ingestion with real-time dispatch to durable orchestrators, last-state store (JmlLastState) with write-on-success semantic, last-state deriver for Joiner/Mover/Leaver/Skip classification (no Graph API call needed), bootstrap seed script for go-live baseline, rehire detection, CSV execution, direct HTTP lifecycle events.
+
+**Integration:** AWS IAM Identity Center SCIM provisioning, Microsoft 365 group-based access, Azure deployment through GitHub Actions with OIDC authentication.
 
 ### In Progress / Planned
 
-* Webhook-layer idempotency + HMAC signature verification
-* Reviewable Mover hold queue with release/resume — pre-flight BLOCK events currently write to an in-memory hold store, not a persistent, reviewable queue
-* Standalone Validation Engine as continuous, tenant-wide evaluation (scheduled scanner)
-* Event-store recovery/reclaim for failed events
-* Reconciliation pipeline (event repair; also the home for automated remediation of detected drift)
-* Resumable recovery for a partially failed Leaver (the deferred-delete path is built; broader mid-run resume is not)
-* Entra Entitlement Management approval workflow integration
-* Storage-enforced audit immutability (write-once blob)
-* Managed Identity authentication
-* Salesforce SCIM integration
+- Webhook-layer idempotency + HMAC signature verification
+- Reviewable Mover hold queue with release/resume (pre-flight BLOCK events currently write to an in-memory hold, not a persistent queue)
+- Standalone Validation Engine as continuous, tenant-wide evaluation (scheduled scanner)
+- Event-store recovery/reclaim for failed events
+- Reconciliation pipeline (event repair and automated drift remediation)
+- Resumable recovery for a partially failed Leaver (deferred-delete path is built; broader mid-run resume is not)
+- Entra Entitlement Management approval workflow integration
+- Storage-enforced audit immutability (write-once blob)
+- Managed Identity authentication
+- Salesforce SCIM integration
 
 ---
 
 ## Calling the API
 
-All three lifecycle pipelines accept JSON over HTTP.
-
-The deployed Function App reads its credentials and connection strings (Graph client credentials, storage connection strings) from its application settings, configured locally in `local.settings.json`.
+All three lifecycle pipelines accept JSON over HTTP. The deployed Function App reads credentials and connection strings from application settings (configured locally in `local.settings.json`).
 
 ```bash
 curl -X POST \
@@ -342,96 +293,69 @@ curl -X POST \
   }'
 ```
 
-The same pattern is available for:
-
-```text
-/api/joiner
-/api/mover
-/api/leaver
-```
-
-Each pipeline additionally exposes a Durable Functions endpoint — `/api/joiner-durable`, `/api/mover-durable`, and `/api/leaver-durable` — which returns `202 Accepted` with a status URL and runs the pipeline as an orchestration. The synchronous `/api/joiner`, `/api/mover`, and `/api/leaver` endpoints remain available.
+| Endpoint | Mode |
+| --- | --- |
+| `/api/joiner`, `/api/mover`, `/api/leaver` | Synchronous |
+| `/api/joiner-durable`, `/api/mover-durable`, `/api/leaver-durable` | Durable (returns `202 Accepted` with status URL) |
+| `/api/webhook_bamboohr` | Webhook — dispatches to durable orchestrators |
 
 ### BambooHR Webhook
 
-The `/api/webhook_bamboohr` endpoint receives BambooHR webhook events, fetches the full employee record, maps it to the canonical identity shape, and classifies the lifecycle action by comparing against the last reconciled state in JmlLastState — no Entra Graph call needed. The correct durable orchestrator (Joiner, Mover, or Leaver) is dispatched automatically. Each orchestrator writes the mapped record back to JmlLastState on successful completion, keeping the store current for the next webhook.
+The webhook endpoint receives BambooHR events, fetches the full employee record, maps it to the canonical identity shape, and classifies the lifecycle action by comparing against the last reconciled state in JmlLastState. The correct durable orchestrator (Joiner, Mover, or Leaver) is dispatched automatically. Each orchestrator writes the mapped record back to JmlLastState on successful completion.
 
-The webhook accepts multiple payload shapes: event-based (`{"data": {"employeeId": "..."}}`), standard (`{"employees": [{"id": "..."}]}`), and single-event shorthand (`{"employee_id": "..."}`).
+The webhook accepts multiple payload shapes:
 
 ```bash
-curl -X POST \
-  "https://<function-app>.azurewebsites.net/api/webhook_bamboohr?code=<function-key>" \
-  -H "Content-Type: application/json" \
-  -d '{"employees": [{"id": "123"}]}'
+# Event-based
+{"data": {"employeeId": "123"}}
+
+# Standard
+{"employees": [{"id": "123"}]}
+
+# Single-event shorthand
+{"employee_id": "123"}
 ```
+
+> **Note:** The webhook is currently secured by function key. HMAC signature verification is planned.
 
 ---
 
 ## Design Principles
 
-### Governance before access
+**Governance before access.** Policy and governance are evaluated before provisioning. The PreProvision gate can stop an event before any Graph write, and the Mover pre-flight can stop or reorder a role change before any package is submitted.
 
-Policy and governance are evaluated before provisioning. The PreProvision gate can stop an event before any Graph write, and the Mover pre-flight can stop or reorder a role change before any package is submitted.
+**Detective backstop after access.** After delivery, PostProvision reads real tenant state and records anything preventive controls could not stop — drift, direct-assignment conflicts, Warn-level SoD. It reports; it does not remediate.
 
-### Detective backstop after access
+**Least privilege by policy.** Access is derived from defined entitlement rules rather than convenience membership.
 
-After delivery, PostProvision reads real tenant state and records anything preventive controls could not stop — drift, direct-assignment conflicts, Warn-level SoD. It reports; it does not remediate.
+**Fail closed.** When required governance information cannot be established, the lifecycle event is blocked.
 
-### Least privilege by policy
+**Fail safe on offboarding.** The account is disabled and sessions revoked before access removal begins.
 
-Access is derived from defined entitlement rules rather than convenience membership.
+**Add before remove — unless a conflict says otherwise.** Movers gain destination access before losing existing access, except where the pre-flight has determined a conflicting package must be removed first.
 
-### Fail closed
+**Deterministic resolution.** The same canonical identity and policy produce the same entitlement decision.
 
-When required governance information cannot be established, the lifecycle event is blocked rather than guessed.
+**Verify the tenant.** A successful Graph API response is not treated as proof of the final state. The engine verifies what actually exists in Entra.
 
-### Fail safe on offboarding
-
-The account is disabled and sessions revoked before access removal begins.
-
-### Add before remove — unless a conflict says otherwise
-
-Movers gain the required destination access before losing their existing access, except where the pre-flight has determined that a specific conflicting package must be removed first to avoid a platform rejection.
-
-### Deterministic resolution
-
-The same canonical identity and policy produce the same entitlement decision.
-
-### Verify the tenant
-
-A successful Graph API response is not treated as proof of the final state. The engine verifies what actually exists in Entra.
-
-### Audit by design
-
-Each lifecycle event produces an audit record containing the decision and execution outcome.
+**Audit by design.** Each lifecycle event produces an audit record containing the decision and execution outcome.
 
 ---
 
 ## Documentation
 
-| Document                                   | Purpose                                          |
-| ------------------------------------------ | ------------------------------------------------ |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md)       | Detailed system architecture and pipeline design |
-| [`DEVELOPER.md`](DEVELOPER.md)             | Repository structure and development guide       |
-| [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md) | Governance model and validation controls         |
-| [`docs/ADR.md`](docs/ADR.md)               | Architecture Decision Records                    |
+| Document | Purpose |
+| --- | --- |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | System architecture and pipeline design |
+| [`DEVELOPER.md`](DEVELOPER.md) | Repository structure and development guide |
+| [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md) | Governance model and validation controls |
+| [`docs/ADR.md`](docs/ADR.md) | Architecture Decision Records |
 
 ---
 
 ## Related Projects
 
-| Project                                     | Purpose                                                        |
-| ------------------------------------------- | -------------------------------------------------------------- |
-| **Validation Engine**                       | Standalone, continuous, tenant-wide detection of governance violations across Microsoft Entra ID (RBAC, cross-plane, hygiene, drift). Separate from the JML in-engine gate. |
-| **Catalog Recommendation Engine**           | Analyse existing entitlements and recommend Access Packages    |
-| **Policy-Driven Identity Lifecycle Engine** | Governed Joiner, Mover, and Leaver orchestration               |
-
----
-
-## Project
-
-This project is an implementation of a governance-first approach to identity lifecycle automation.
-
-The objective is not simply to automate provisioning.
-
-It is to make **policy, governance, authorization, execution, verification, and audit part of the same lifecycle**.
+| Project | Purpose |
+| --- | --- |
+| **Validation Engine** | Standalone, continuous, tenant-wide detection of governance violations across Microsoft Entra ID (RBAC, cross-plane, hygiene, drift). Separate from the JML in-engine gate. |
+| **Catalog Recommendation Engine** | Analyse existing entitlements and recommend Access Packages |
